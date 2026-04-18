@@ -1,16 +1,18 @@
 use std::collections::hash_map::DefaultHasher;
+use std::fs;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::stream::StreamExt;
 use libp2p::{
-    gossipsub, mdns, noise,
+    gossipsub, identity, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::{io, select, sync::mpsc};
 
 const TOPIC: &str = "lan-chat-v1";
@@ -58,6 +60,37 @@ fn set_node_status(status: NodeStatus) {
 
 static PUBLISHER_TX: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
+// ───────────────────────── Identité persistante ─────────────────────────
+
+const IDENTITY_FILE: &str = "identity.key";
+
+fn identity_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = app.path().app_data_dir()?;
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(IDENTITY_FILE))
+}
+
+/// Charge la keypair ed25519 depuis `<app_data>/identity.key` si elle existe.
+/// Sinon, en génère une nouvelle et la persiste. Encodage protobuf libp2p.
+fn load_or_create_identity(
+    app: &AppHandle,
+) -> Result<identity::Keypair, Box<dyn std::error::Error>> {
+    let path = identity_path(app)?;
+
+    if path.exists() {
+        let bytes = fs::read(&path)?;
+        let keypair = identity::Keypair::from_protobuf_encoding(&bytes)?;
+        eprintln!("[lan-chat] Identity loaded from {}", path.display());
+        Ok(keypair)
+    } else {
+        let keypair = identity::Keypair::generate_ed25519();
+        let bytes = keypair.to_protobuf_encoding()?;
+        fs::write(&path, bytes)?;
+        eprintln!("[lan-chat] Fresh identity generated at {}", path.display());
+        Ok(keypair)
+    }
+}
+
 // ───────────────────────── Commandes Tauri ─────────────────────────
 
 #[tauri::command]
@@ -91,8 +124,9 @@ fn send_message(message: ChatMessage) -> Result<(), String> {
 async fn run_swarm(
     app: AppHandle,
     mut rx: mpsc::UnboundedReceiver<String>,
+    keypair: identity::Keypair,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut swarm = SwarmBuilder::with_new_identity()
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -206,8 +240,22 @@ pub fn run() {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
             let _ = PUBLISHER_TX.set(tx);
 
+            // Identité ed25519 persistante (chargée ou créée)
+            let keypair = match load_or_create_identity(&handle) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    let msg = format!("Échec du chargement de l'identité : {}", e);
+                    eprintln!("[lan-chat] {}", msg);
+                    set_node_status(NodeStatus::Error {
+                        message: msg.clone(),
+                    });
+                    let _ = handle.emit("node-error", msg);
+                    return Ok(());
+                }
+            };
+
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_swarm(handle.clone(), rx).await {
+                if let Err(e) = run_swarm(handle.clone(), rx, keypair).await {
                     let msg = format!("Erreur libp2p : {}", e);
                     eprintln!("[lan-chat] {}", msg);
                     set_node_status(NodeStatus::Error {
