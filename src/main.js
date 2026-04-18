@@ -13,18 +13,7 @@ const invoke = tauriCore ? tauriCore.invoke : async () => {
 };
 const listen = tauriEvent ? tauriEvent.listen : async () => () => {};
 
-// ───────────────────────── Identité locale ─────────────────────────
-
-const STORAGE_KEY_ID = "lanchat:senderId";
-
-function getOrCreateSenderId() {
-  let id = localStorage.getItem(STORAGE_KEY_ID);
-  if (!id) {
-    id = crypto.randomUUID();
-    localStorage.setItem(STORAGE_KEY_ID, id);
-  }
-  return id;
-}
+// ───────────────────────── Helpers ─────────────────────────
 
 function colorFromString(str) {
   let hash = 0;
@@ -46,12 +35,17 @@ function formatTime(ts) {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-const ME = {
-  id: getOrCreateSenderId(),
-  name: "…",
-};
+function shortPeerId(pid) {
+  if (!pid || pid.length < 16) return pid || "?";
+  return `${pid.slice(0, 10)}…${pid.slice(-4)}`;
+}
 
 // ───────────────────────── État ─────────────────────────
+
+const ME = {
+  id: null,   // rempli par le PeerId libp2p dès que le nœud est prêt
+  name: "…",
+};
 
 const seenPeers = new Set();
 const seenMessageIds = new Set();
@@ -84,7 +78,7 @@ function setInputEnabled(enabled) {
 // ───────────────────────── Affichage ─────────────────────────
 
 function registerPeer(senderId) {
-  if (senderId === ME.id) return;
+  if (!senderId || senderId === ME.id) return;
   const before = seenPeers.size;
   seenPeers.add(senderId);
   if (seenPeers.size !== before) {
@@ -144,6 +138,7 @@ function appendSystem(text, variant = "info") {
 // ───────────────────────── Envoi ─────────────────────────
 
 async function sendMessage(content) {
+  if (!ME.id) return; // nœud pas prêt
   const msg = {
     id: crypto.randomUUID(),
     senderName: ME.name,
@@ -152,7 +147,7 @@ async function sendMessage(content) {
     timestamp: Date.now(),
   };
 
-  // Affichage local immédiat (on filtrera l'écho réseau via l'ID)
+  // Affichage local immédiat (on filtrera l'écho réseau via senderId)
   appendMessage(msg, { mine: true });
 
   try {
@@ -162,7 +157,7 @@ async function sendMessage(content) {
   }
 }
 
-// ───────────────────────── Statut du listener ─────────────────────────
+// ───────────────────────── Statut du nœud ─────────────────────────
 
 function applyStatus(status) {
   if (!status || !status.kind) return false;
@@ -170,9 +165,11 @@ function applyStatus(status) {
   if (status.kind === "ready") {
     if (!isReady) {
       isReady = true;
-      setStatus(`Connecté · port UDP ${status.port}`, "ready");
+      ME.id = status.peerId;
+      el.meAvatar.style.background = colorFromString(ME.id);
+      setStatus(`Nœud P2P actif · ${shortPeerId(ME.id)}`, "ready");
       setInputEnabled(true);
-      appendSystem("Vous êtes connecté au réseau local. En attente des pairs…");
+      appendSystem("Nœud libp2p prêt. Découverte mDNS en cours — en attente de pairs…");
     }
     return true;
   }
@@ -180,29 +177,28 @@ function applyStatus(status) {
   if (status.kind === "error") {
     setStatus(`Erreur : ${status.message}`, "error");
     appendSystem(
-      "Le port UDP n'a pas pu être ouvert. Un autre programme l'utilise peut-être, ou le pare-feu l'a bloqué.",
+      `Le nœud libp2p n'a pas pu démarrer : ${status.message}`,
       "error"
     );
     return true;
   }
 
-  // kind === "initializing"
+  // "initializing"
   return false;
 }
 
 async function pollStatus() {
-  const MAX_ATTEMPTS = 50; // ~20 secondes
+  const MAX_ATTEMPTS = 150; // ~60 secondes (démarrage libp2p peut prendre quelques secondes)
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
     try {
-      const status = await invoke("get_listener_status");
-      const resolved = applyStatus(status);
-      if (resolved) return;
+      const status = await invoke("get_node_status");
+      if (applyStatus(status)) return;
     } catch (e) {
-      console.error("[lan-chat] get_listener_status failed:", e);
+      console.error("[lan-chat] get_node_status failed:", e);
     }
     await new Promise((r) => setTimeout(r, 400));
   }
-  setStatus("Délai d'attente dépassé — le listener ne démarre pas.", "error");
+  setStatus("Délai d'attente dépassé — le nœud libp2p ne démarre pas.", "error");
 }
 
 // ───────────────────────── Événements Tauri (backup) ─────────────────────────
@@ -210,15 +206,15 @@ async function pollStatus() {
 listen("chat-message", (event) => {
   const msg = event.payload;
   registerPeer(msg.senderId);
-  if (msg.senderId === ME.id) return; // écho réseau de notre propre envoi
+  if (msg.senderId === ME.id) return; // écho de notre propre publish
   appendMessage(msg, { mine: false });
 });
 
-listen("listener-ready", (event) => {
-  applyStatus({ kind: "ready", port: event.payload });
+listen("node-ready", (event) => {
+  applyStatus({ kind: "ready", peerId: event.payload });
 });
 
-listen("listener-error", (event) => {
+listen("node-error", (event) => {
   applyStatus({ kind: "error", message: event.payload });
 });
 
@@ -231,7 +227,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     ME.name = "Inconnu";
   }
   el.meName.textContent = ME.name;
-  el.meAvatar.style.background = colorFromString(ME.id);
   el.meAvatar.textContent = initials(ME.name);
 
   el.form.addEventListener("submit", (e) => {
@@ -242,6 +237,5 @@ window.addEventListener("DOMContentLoaded", async () => {
     el.input.value = "";
   });
 
-  // Interroge l'état du listener côté Rust en boucle jusqu'à ce qu'il soit ready/error
   pollStatus();
 });
