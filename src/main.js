@@ -43,13 +43,15 @@ function shortPeerId(pid) {
 // ───────────────────────── État ─────────────────────────
 
 const ME = {
-  id: null,   // rempli par le PeerId libp2p dès que le nœud est prêt
+  id: null, // rempli par le PeerId libp2p dès que le nœud est prêt
   name: "…",
 };
 
 const seenPeers = new Set();
 const seenMessageIds = new Set();
 let isReady = false;
+let pollToken = 0;
+let hasAcceptedRoom = false;
 
 // ───────────────────────── DOM ─────────────────────────
 
@@ -62,6 +64,13 @@ const el = {
   form: document.getElementById("chat-form"),
   input: document.getElementById("chat-input"),
   send: document.querySelector(".composer__send"),
+  roomBadge: document.getElementById("room-badge"),
+  roomName: document.getElementById("room-name"),
+  changeRoomBtn: document.getElementById("change-room-btn"),
+  overlay: document.getElementById("room-overlay"),
+  roomForm: document.getElementById("room-form"),
+  roomInput: document.getElementById("room-code-input"),
+  roomError: document.getElementById("room-error"),
 };
 
 function setStatus(text, variant = "info") {
@@ -73,6 +82,26 @@ function setInputEnabled(enabled) {
   el.input.disabled = !enabled;
   el.send.disabled = !enabled;
   if (enabled) el.input.focus();
+}
+
+function showOverlay() {
+  el.overlay.hidden = false;
+  el.roomInput.focus();
+}
+
+function hideOverlay() {
+  el.overlay.hidden = true;
+  hideRoomError();
+}
+
+function showRoomError(msg) {
+  el.roomError.textContent = String(msg);
+  el.roomError.hidden = false;
+}
+
+function hideRoomError() {
+  el.roomError.hidden = true;
+  el.roomError.textContent = "";
 }
 
 // ───────────────────────── Affichage ─────────────────────────
@@ -162,14 +191,33 @@ async function sendMessage(content) {
 function applyStatus(status) {
   if (!status || !status.kind) return false;
 
+  if (status.kind === "awaitingRoom") {
+    if (hasAcceptedRoom) {
+      // Le set_room_code a déjà été envoyé — on ignore ce statut stale
+      // et on continue le polling jusqu'au "ready".
+      return false;
+    }
+    setStatus("En attente du code de salon…", "info");
+    showOverlay();
+    return true; // on arrête le polling tant que l'utilisateur n'a pas saisi un code
+  }
+
   if (status.kind === "ready") {
     if (!isReady) {
       isReady = true;
       ME.id = status.peerId;
       el.meAvatar.style.background = colorFromString(ME.id);
-      setStatus(`Nœud P2P actif · ${shortPeerId(ME.id)}`, "ready");
+
+      const roomName = status.roomName || "?";
+      el.roomName.textContent = roomName;
+      el.roomBadge.hidden = false;
+
+      setStatus(`Salon « ${roomName} » · ${shortPeerId(ME.id)}`, "ready");
+      hideOverlay();
       setInputEnabled(true);
-      appendSystem("Nœud libp2p prêt. Découverte mDNS en cours — en attente de pairs…");
+      appendSystem(
+        `Connecté au salon « ${roomName} » (chiffré E2E). Découverte mDNS en cours.`
+      );
     }
     return true;
   }
@@ -188,8 +236,10 @@ function applyStatus(status) {
 }
 
 async function pollStatus() {
-  const MAX_ATTEMPTS = 150; // ~60 secondes (démarrage libp2p peut prendre quelques secondes)
+  const MAX_ATTEMPTS = 150; // ~60 secondes
+  const myToken = ++pollToken;
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    if (myToken !== pollToken) return; // un autre poll a été lancé
     try {
       const status = await invoke("get_node_status");
       if (applyStatus(status)) return;
@@ -201,7 +251,44 @@ async function pollStatus() {
   setStatus("Délai d'attente dépassé — le nœud libp2p ne démarre pas.", "error");
 }
 
-// ───────────────────────── Événements Tauri (backup) ─────────────────────────
+// ───────────────────────── Salon ─────────────────────────
+
+async function onRoomSubmit(e) {
+  e.preventDefault();
+  const code = el.roomInput.value.trim();
+  if (!code) return;
+  hideRoomError();
+  try {
+    await invoke("set_room_code", { code });
+    hasAcceptedRoom = true;
+    hideOverlay();
+    setStatus("Connexion au salon…", "info");
+    pollStatus();
+  } catch (err) {
+    console.error("[lan-chat] set_room_code failed:", err);
+    showRoomError(err);
+  }
+}
+
+async function onChangeRoom() {
+  const ok = confirm(
+    "Changer de salon supprime ta config locale. Tu devras relancer l'app pour choisir un nouveau code. Continuer ?"
+  );
+  if (!ok) return;
+  try {
+    await invoke("reset_room");
+    setStatus("Salon effacé. Relance l'app pour en choisir un nouveau.", "warn");
+    appendSystem(
+      "Salon effacé. Ferme et relance l'app pour rejoindre un autre salon.",
+      "info"
+    );
+    setInputEnabled(false);
+  } catch (err) {
+    appendSystem(`Erreur reset_room : ${err}`, "error");
+  }
+}
+
+// ───────────────────────── Événements Tauri ─────────────────────────
 
 listen("chat-message", (event) => {
   const msg = event.payload;
@@ -211,7 +298,16 @@ listen("chat-message", (event) => {
 });
 
 listen("node-ready", (event) => {
-  applyStatus({ kind: "ready", peerId: event.payload });
+  const payload = event.payload || {};
+  applyStatus({
+    kind: "ready",
+    peerId: payload.peerId,
+    roomName: payload.roomName,
+  });
+});
+
+listen("node-awaiting-room", () => {
+  applyStatus({ kind: "awaitingRoom" });
 });
 
 listen("node-error", (event) => {
@@ -236,6 +332,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     sendMessage(content);
     el.input.value = "";
   });
+
+  el.roomForm.addEventListener("submit", onRoomSubmit);
+  el.changeRoomBtn.addEventListener("click", onChangeRoom);
 
   pollStatus();
 });
