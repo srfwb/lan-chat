@@ -1,6 +1,8 @@
 // Accès aux APIs Tauri (exposées en global via withGlobalTauri: true)
 const tauriCore = window.__TAURI__ && window.__TAURI__.core;
 const tauriEvent = window.__TAURI__ && window.__TAURI__.event;
+const tauriDialog = window.__TAURI__ && window.__TAURI__.dialog;
+const tauriShell = window.__TAURI__ && window.__TAURI__.shell;
 
 if (!tauriCore || !tauriEvent) {
   console.error(
@@ -12,6 +14,8 @@ const invoke = tauriCore ? tauriCore.invoke : async () => {
   throw new Error("Tauri indisponible");
 };
 const listen = tauriEvent ? tauriEvent.listen : async () => () => {};
+const openFileDialog = tauriDialog ? tauriDialog.open : null;
+const openWithSystem = tauriShell ? tauriShell.open : null;
 
 // ───────────────────────── Helpers ─────────────────────────
 
@@ -40,6 +44,30 @@ function shortPeerId(pid) {
   return `${pid.slice(0, 10)}…${pid.slice(-4)}`;
 }
 
+function formatBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return "? o";
+  if (n < 1024) return `${n} o`;
+  const units = ["Ko", "Mo", "Go", "To"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+
+function fileIconForMime(mime) {
+  if (!mime) return "📄";
+  if (mime.startsWith("image/")) return "🖼";
+  if (mime.startsWith("video/")) return "🎬";
+  if (mime.startsWith("audio/")) return "🎵";
+  if (mime.includes("pdf")) return "📕";
+  if (mime.includes("zip") || mime.includes("compressed") || mime.includes("tar")) return "🗜";
+  if (mime.startsWith("text/") || mime.includes("json") || mime.includes("xml")) return "📝";
+  return "📄";
+}
+
 // ───────────────────────── État ─────────────────────────
 
 const ME = {
@@ -66,6 +94,8 @@ const el = {
   form: document.getElementById("chat-form"),
   input: document.getElementById("chat-input"),
   send: document.querySelector(".composer__send"),
+  attachBtn: document.getElementById("attach-btn"),
+  dropOverlay: document.getElementById("drop-overlay"),
   roomBadge: document.getElementById("room-badge"),
   roomName: document.getElementById("room-name"),
   changeRoomBtn: document.getElementById("change-room-btn"),
@@ -76,6 +106,9 @@ const el = {
   syncIndicator: document.getElementById("sync-indicator"),
 };
 
+// Circumférence de l'anneau de progression : 2π × 19px de rayon
+const RING_CIRCUMFERENCE = 2 * Math.PI * 19;
+
 function setStatus(text, variant = "info") {
   el.status.textContent = text;
   el.status.dataset.variant = variant;
@@ -84,6 +117,7 @@ function setStatus(text, variant = "info") {
 function setInputEnabled(enabled) {
   el.input.disabled = !enabled;
   el.send.disabled = !enabled;
+  if (el.attachBtn) el.attachBtn.disabled = !enabled;
   if (enabled) el.input.focus();
 }
 
@@ -253,6 +287,245 @@ async function renderHistoryThenSystem(roomName) {
   );
 }
 
+// ───────────────────────── Fichiers ─────────────────────────
+
+/** Track des offers reçues côté UI : file_id → { senderId, filename, size, mime } */
+const fileOffers = new Map();
+/** file_id → DOM de la bulle */
+const fileBubbles = new Map();
+
+/**
+ * Construit la structure d'une bulle fichier. Les états sont gérés via data-state
+ * et la mise à jour du SVG ring (stroke-dashoffset) + des textes.
+ */
+function buildFileBubbleElement(offer, { mine, state }) {
+  const wrapper = document.createElement("div");
+  wrapper.className = `message ${mine ? "message--mine" : "message--them"}`;
+  wrapper.dataset.timestamp = String(offer.timestamp);
+
+  const avatar = document.createElement("span");
+  avatar.className = "message__avatar";
+  avatar.style.background = colorFromString(offer.senderId || ME.id);
+  avatar.textContent = initials(offer.senderName || ME.name);
+  avatar.setAttribute("aria-hidden", "true");
+
+  const bubble = document.createElement("div");
+  bubble.className = "message__bubble";
+
+  const head = document.createElement("div");
+  head.className = "message__head";
+  const sender = document.createElement("span");
+  sender.className = "message__sender";
+  sender.textContent = mine ? "Moi" : offer.senderName;
+  const time = document.createElement("span");
+  time.className = "message__time";
+  time.textContent = formatTime(offer.timestamp);
+  head.appendChild(sender);
+  head.appendChild(time);
+
+  // Cœur de la bulle fichier
+  const fileRow = document.createElement("div");
+  fileRow.className = "file-bubble";
+  fileRow.dataset.fileId = offer.id;
+  fileRow.dataset.state = state;
+  fileRow.dataset.mine = String(!!mine);
+  fileRow.dataset.senderPeer = offer.senderId;
+
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "file-bubble__action";
+  action.setAttribute("aria-label", "Télécharger le fichier");
+
+  // Anneau SVG (track + progress)
+  action.innerHTML = `
+    <svg class="file-bubble__ring" width="44" height="44" viewBox="0 0 44 44" aria-hidden="true">
+      <circle class="file-bubble__ring-track" cx="22" cy="22" r="19"></circle>
+      <circle class="file-bubble__ring-progress" cx="22" cy="22" r="19"
+              stroke-dasharray="${RING_CIRCUMFERENCE.toFixed(2)}"
+              stroke-dashoffset="${RING_CIRCUMFERENCE.toFixed(2)}"></circle>
+    </svg>
+    <span class="file-bubble__icon"></span>
+  `;
+
+  const info = document.createElement("div");
+  info.className = "file-bubble__info";
+  const name = document.createElement("span");
+  name.className = "file-bubble__name";
+  name.textContent = offer.filename;
+  name.title = offer.filename;
+  const meta = document.createElement("span");
+  meta.className = "file-bubble__meta";
+  info.appendChild(name);
+  info.appendChild(meta);
+
+  fileRow.appendChild(action);
+  fileRow.appendChild(info);
+
+  bubble.appendChild(head);
+  bubble.appendChild(fileRow);
+
+  wrapper.appendChild(avatar);
+  wrapper.appendChild(bubble);
+
+  // Wiring handler selon l'état initial
+  applyFileBubbleState(fileRow, offer, state);
+
+  return wrapper;
+}
+
+function appendFileBubble(offer, { mine, state }) {
+  if (fileBubbles.has(offer.id)) return;
+  const wrapper = buildFileBubbleElement(offer, { mine, state });
+  el.messages.appendChild(wrapper);
+  fileBubbles.set(offer.id, wrapper.querySelector(".file-bubble"));
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+/** Met à jour l'icône, meta et l'anneau en fonction de l'état courant. */
+function applyFileBubbleState(fileRow, offer, state) {
+  fileRow.dataset.state = state;
+  const iconEl = fileRow.querySelector(".file-bubble__icon");
+  const metaEl = fileRow.querySelector(".file-bubble__meta");
+  const actionEl = fileRow.querySelector(".file-bubble__action");
+
+  actionEl.onclick = null;
+
+  if (state === "available") {
+    iconEl.textContent = "⬇";
+    metaEl.textContent = `${formatBytes(offer.size)} · à télécharger`;
+    setRingPct(fileRow, 0);
+    actionEl.onclick = () => onDownloadClick(offer);
+    actionEl.setAttribute("aria-label", "Télécharger le fichier");
+    actionEl.disabled = false;
+  } else if (state === "sent") {
+    iconEl.textContent = fileIconForMime(offer.mime);
+    metaEl.textContent = `${formatBytes(offer.size)} · Envoyé`;
+    setRingPct(fileRow, 100);
+    actionEl.disabled = true;
+    actionEl.setAttribute("aria-label", "Fichier envoyé");
+  } else if (state === "downloading") {
+    iconEl.textContent = "⏸";
+    metaEl.textContent = `0 / ${formatBytes(offer.size)} · 0 %`;
+    setRingPct(fileRow, 0);
+    actionEl.disabled = true; // annulation : hors scope v1
+    actionEl.setAttribute("aria-label", "Téléchargement en cours");
+  } else if (state === "completed") {
+    iconEl.textContent = fileIconForMime(offer.mime);
+    metaEl.textContent = `${formatBytes(offer.size)} · Ouvrir`;
+    setRingPct(fileRow, 100);
+    actionEl.disabled = false;
+    actionEl.onclick = () => onOpenClick(fileRow);
+    actionEl.setAttribute("aria-label", "Ouvrir le fichier");
+  } else if (state === "error") {
+    iconEl.textContent = "⚠";
+    // meta est rempli par updateFileBubbleError
+    actionEl.disabled = false;
+    actionEl.onclick = () => onDownloadClick(offer); // retry
+    actionEl.setAttribute("aria-label", "Réessayer le téléchargement");
+  }
+}
+
+function setRingPct(fileRow, pct) {
+  const ring = fileRow.querySelector(".file-bubble__ring-progress");
+  if (!ring) return;
+  const clamped = Math.max(0, Math.min(100, pct));
+  const offset = RING_CIRCUMFERENCE * (1 - clamped / 100);
+  ring.style.strokeDashoffset = String(offset);
+}
+
+function updateFileBubbleProgress(fileId, received, total) {
+  const fileRow = fileBubbles.get(fileId);
+  if (!fileRow) return;
+  const pct = total > 0 ? (received / total) * 100 : 0;
+  setRingPct(fileRow, pct);
+  const metaEl = fileRow.querySelector(".file-bubble__meta");
+  if (metaEl) {
+    metaEl.textContent = `${formatBytes(received)} / ${formatBytes(total)} · ${Math.round(pct)} %`;
+  }
+}
+
+function updateFileBubbleCompleted(fileId, localPath) {
+  const fileRow = fileBubbles.get(fileId);
+  if (!fileRow) return;
+  const offer = fileOffers.get(fileId);
+  if (!offer) return;
+  fileRow.dataset.localPath = localPath;
+  applyFileBubbleState(fileRow, offer, "completed");
+}
+
+function updateFileBubbleError(fileId, message) {
+  const fileRow = fileBubbles.get(fileId);
+  if (!fileRow) return;
+  const offer = fileOffers.get(fileId);
+  if (!offer) return;
+  applyFileBubbleState(fileRow, offer, "error");
+  const metaEl = fileRow.querySelector(".file-bubble__meta");
+  if (metaEl) metaEl.textContent = `Erreur : ${message}`;
+  setRingPct(fileRow, 0);
+}
+
+async function onDownloadClick(offer) {
+  const fileRow = fileBubbles.get(offer.id);
+  if (!fileRow) return;
+  applyFileBubbleState(fileRow, offer, "downloading");
+  try {
+    await invoke("download_file", {
+      fileId: offer.id,
+      senderPeer: offer.senderId,
+    });
+  } catch (e) {
+    updateFileBubbleError(offer.id, String(e));
+  }
+}
+
+async function onOpenClick(fileRow) {
+  const path = fileRow.dataset.localPath;
+  if (!path) return;
+  if (!openWithSystem) {
+    appendSystem("Ouverture impossible : plugin shell indisponible.", "error");
+    return;
+  }
+  try {
+    await openWithSystem(path);
+  } catch (e) {
+    appendSystem(`Ouverture du fichier échouée : ${e}`, "error");
+  }
+}
+
+async function sendFile(path) {
+  if (!ME.id) {
+    appendSystem("Impossible d'envoyer un fichier : le nœud n'est pas encore prêt.", "error");
+    return;
+  }
+  const fileId = crypto.randomUUID();
+  try {
+    const offer = await invoke("offer_file", {
+      path,
+      fileId,
+      senderName: ME.name,
+    });
+    fileOffers.set(offer.id, offer);
+    appendFileBubble(offer, { mine: true, state: "sent" });
+  } catch (e) {
+    appendSystem(`Envoi du fichier échoué : ${e}`, "error");
+  }
+}
+
+async function onAttachClick() {
+  if (!openFileDialog) {
+    appendSystem("Sélecteur de fichier indisponible.", "error");
+    return;
+  }
+  try {
+    const picked = await openFileDialog({ multiple: false, directory: false });
+    if (typeof picked === "string" && picked.length > 0) {
+      await sendFile(picked);
+    }
+  } catch (e) {
+    appendSystem(`Sélection du fichier échouée : ${e}`, "error");
+  }
+}
+
 // ───────────────────────── Envoi ─────────────────────────
 
 async function sendMessage(content) {
@@ -390,6 +663,8 @@ function resetUiForAwaitingRoom() {
   el.messages.innerHTML = "";
   seenMessageIds.clear();
   seenPeers.clear();
+  fileOffers.clear();
+  fileBubbles.clear();
   el.peersCount.textContent = "0";
   el.roomBadge.hidden = true;
   el.roomName.textContent = "—";
@@ -401,6 +676,7 @@ function resetUiForAwaitingRoom() {
   historySeparator = null;
   activeSyncs = 0;
   updateSyncIndicator();
+  if (el.dropOverlay) el.dropOverlay.hidden = true;
 }
 
 // ───────────────────────── Événements Tauri ─────────────────────────
@@ -410,6 +686,56 @@ listen("chat-message", (event) => {
   registerPeer(msg.senderId);
   if (msg.senderId === ME.id) return; // écho de notre propre publish
   appendMessage(msg, { mine: false });
+});
+
+listen("file-offer", (event) => {
+  const offer = event.payload;
+  if (!offer || !offer.id) return;
+  registerPeer(offer.senderId);
+  // Écho de notre propre publish : on a déjà affiché la bulle "Envoyé" localement
+  if (offer.senderId === ME.id) return;
+  fileOffers.set(offer.id, offer);
+  appendFileBubble(offer, { mine: false, state: "available" });
+});
+
+listen("file-progress", (event) => {
+  const { fileId, received, total } = event.payload || {};
+  if (!fileId) return;
+  updateFileBubbleProgress(fileId, received, total);
+});
+
+listen("file-completed", (event) => {
+  const { fileId, localPath } = event.payload || {};
+  if (!fileId) return;
+  updateFileBubbleCompleted(fileId, localPath);
+});
+
+listen("file-error", (event) => {
+  const { fileId, message } = event.payload || {};
+  if (!fileId) return;
+  updateFileBubbleError(fileId, message || "erreur inconnue");
+});
+
+// Drag & drop — Tauri v2 émet sur la fenêtre : hover / drop / cancelled.
+listen("tauri://drag-enter", () => {
+  if (!isReady) return;
+  if (el.dropOverlay) el.dropOverlay.hidden = false;
+});
+listen("tauri://drag-over", () => {
+  if (!isReady) return;
+  if (el.dropOverlay) el.dropOverlay.hidden = false;
+});
+listen("tauri://drag-leave", () => {
+  if (el.dropOverlay) el.dropOverlay.hidden = true;
+});
+listen("tauri://drag-drop", async (event) => {
+  if (el.dropOverlay) el.dropOverlay.hidden = true;
+  if (!isReady) return;
+  const paths = event.payload?.paths;
+  if (!Array.isArray(paths) || paths.length === 0) return;
+  for (const p of paths) {
+    await sendFile(p);
+  }
 });
 
 // Message reçu via P2P history sync : insertion triée par timestamp avant le séparateur.
@@ -471,6 +797,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   el.roomForm.addEventListener("submit", onRoomSubmit);
   el.changeRoomBtn.addEventListener("click", onChangeRoom);
+  if (el.attachBtn) el.attachBtn.addEventListener("click", onAttachClick);
 
   pollStatus();
 });

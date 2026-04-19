@@ -1,6 +1,6 @@
 [package]
 name = "lan-chat"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zero-config, end-to-end encrypted LAN messenger"
 authors = ["srfwb"]
 edition = "2021"
@@ -22,6 +22,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hostname = "0.4"
@@ -32,6 +34,7 @@ sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
+mime_guess = "2.0"
 libp2p = { version = "0.55", features = [
     "tokio",
     "gossipsub",
