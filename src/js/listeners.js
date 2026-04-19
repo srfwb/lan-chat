@@ -32,7 +32,10 @@ export function registerTauriListeners() {
     insertHistoryMessage(msg, { mine: msg.senderId === ME.id });
   });
 
-  listen("history-sync-start", () => {
+  listen("history-sync-start", (event) => {
+    // payload = peer_id string — on incrémente le compteur de pairs dès la
+    // découverte mDNS, sans attendre qu'un message arrive effectivement.
+    registerPeer(event.payload);
     state.activeSyncs++;
     updateSyncIndicator();
   });
