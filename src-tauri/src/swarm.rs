@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +7,8 @@ use std::time::Duration;
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::stream::StreamExt;
 use libp2p::{
-    gossipsub, identity, mdns, noise, request_response,
+    gossipsub, identity, mdns, noise,
+    request_response::{self, OutboundRequestId},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId, StreamProtocol, SwarmBuilder,
 };
@@ -19,7 +20,8 @@ use crate::app_state::{
 };
 use crate::crypto::{cipher_from_key, decrypt_wire_message, encrypt_wire_message};
 use crate::files::{
-    ingest_chunk, serve_chunk, ChunkRequest, ChunkResponse, SwarmFileCmd,
+    abort_download, emit_file_error, ingest_chunk, serve_chunk, ChunkRequest, ChunkResponse,
+    SwarmFileCmd,
 };
 use crate::history::{
     append_to_history_if_new, build_history_response, history_path_for, ingest_history_response,
@@ -167,6 +169,11 @@ pub async fn run_swarm(
     let mut pending_sync: HashSet<PeerId> = HashSet::new();
     let mut synced: HashSet<PeerId> = HashSet::new();
 
+    // Corrélation `OutboundRequestId → file_id` pour remonter erreurs fichier au front.
+    // ChunkResponse::NotFound/Error et OutboundFailure ne portent pas le file_id
+    // dans leur payload — on le retrouve via la RequestId stockée à l'envoi.
+    let mut pending_chunk_requests: HashMap<OutboundRequestId, String> = HashMap::new();
+
     loop {
         select! {
             maybe_msg = rx.recv() => {
@@ -191,13 +198,26 @@ pub async fn run_swarm(
             maybe_cmd = file_cmd_rx.recv() => {
                 match maybe_cmd {
                     Some(SwarmFileCmd::RequestChunk { peer, request }) => {
-                        swarm.behaviour_mut().file_transfer.send_request(&peer, request);
+                        let file_id = request.file_id.clone();
+                        let request_id = swarm
+                            .behaviour_mut()
+                            .file_transfer
+                            .send_request(&peer, request);
+                        pending_chunk_requests.insert(request_id, file_id);
                     }
                     None => break,
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &cipher, &app, &mut pending_sync, &mut synced);
+                handle_swarm_event(
+                    event,
+                    &mut swarm,
+                    &cipher,
+                    &app,
+                    &mut pending_sync,
+                    &mut synced,
+                    &mut pending_chunk_requests,
+                );
             }
         }
     }
@@ -224,6 +244,7 @@ fn handle_swarm_event(
     app: &AppHandle,
     pending_sync: &mut HashSet<PeerId>,
     synced: &mut HashSet<PeerId>,
+    pending_chunk_requests: &mut HashMap<OutboundRequestId, String>,
 ) {
     match event {
         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
@@ -304,27 +325,75 @@ fn handle_swarm_event(
                         .file_transfer
                         .send_response(channel, response);
                 }
-                request_response::Message::Response { response, .. } => match response {
-                    ChunkResponse::Ok { file_id, data } => {
-                        ingest_chunk(cipher, &file_id, data, app);
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    let tracked_file_id = pending_chunk_requests.remove(&request_id);
+                    match response {
+                        ChunkResponse::Ok { file_id, data } => {
+                            ingest_chunk(cipher, &file_id, data, app);
+                        }
+                        ChunkResponse::NotFound => match tracked_file_id {
+                            Some(fid) => {
+                                eprintln!(
+                                    "[lan-chat] Chunk response: NotFound from {} (file_id={})",
+                                    peer, fid
+                                );
+                                emit_file_error(app, &fid, "le pair ne sert plus ce fichier");
+                                abort_download(&fid);
+                            }
+                            None => {
+                                eprintln!(
+                                    "[lan-chat] Chunk response: NotFound from {} (unknown request)",
+                                    peer
+                                );
+                            }
+                        },
+                        ChunkResponse::Error { message } => match tracked_file_id {
+                            Some(fid) => {
+                                eprintln!(
+                                    "[lan-chat] Chunk response error from {} (file_id={}): {}",
+                                    peer, fid, message
+                                );
+                                emit_file_error(
+                                    app,
+                                    &fid,
+                                    &format!("erreur distante : {}", message),
+                                );
+                                abort_download(&fid);
+                            }
+                            None => {
+                                eprintln!(
+                                    "[lan-chat] Chunk response error from {}: {} (unknown request)",
+                                    peer, message
+                                );
+                            }
+                        },
                     }
-                    ChunkResponse::NotFound => {
-                        eprintln!("[lan-chat] Chunk response: NotFound from {}", peer);
-                    }
-                    ChunkResponse::Error { message } => {
-                        eprintln!(
-                            "[lan-chat] Chunk response error from {}: {}",
-                            peer, message
-                        );
-                    }
-                },
+                }
             },
-            request_response::Event::OutboundFailure { peer, error, .. } => {
-                eprintln!(
-                    "[lan-chat] File transfer outbound failure to {}: {}",
-                    peer, error
-                );
-            }
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => match pending_chunk_requests.remove(&request_id) {
+                Some(fid) => {
+                    eprintln!(
+                        "[lan-chat] File transfer outbound failure to {} (file_id={}): {}",
+                        peer, fid, error
+                    );
+                    emit_file_error(app, &fid, &format!("transfert échoué : {}", error));
+                    abort_download(&fid);
+                }
+                None => {
+                    eprintln!(
+                        "[lan-chat] File transfer outbound failure to {}: {} (unknown request)",
+                        peer, error
+                    );
+                }
+            },
             request_response::Event::InboundFailure { peer, error, .. } => {
                 eprintln!(
                     "[lan-chat] File transfer inbound failure from {}: {}",
