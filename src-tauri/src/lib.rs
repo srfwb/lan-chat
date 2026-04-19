@@ -455,9 +455,9 @@ async fn run_swarm(
         loaded_history.len(),
         history_store.path.display()
     );
-    let _ = HISTORY.set(Mutex::new(VecDeque::from(loaded_history.clone())));
+    let _ = HISTORY.set(Mutex::new(VecDeque::from(loaded_history)));
     let _ = HISTORY_STORE.set(history_store);
-    let _ = app.emit("history-loaded", loaded_history);
+    // Le frontend récupère l'historique via invoke("get_history") dans applyStatus(ready).
 
     let topic_for_builder = topic_str.clone();
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)

@@ -52,7 +52,6 @@ const seenMessageIds = new Set();
 let isReady = false;
 let pollToken = 0;
 let hasAcceptedRoom = false;
-let pendingHistory = null; // chargé dès "history-loaded", rendu dès que isReady (ME.id connu)
 
 // ───────────────────────── DOM ─────────────────────────
 
@@ -177,21 +176,29 @@ function appendSeparator(text) {
 }
 
 /**
- * Rend l'historique chargé depuis Rust dès que l'identité locale (ME.id) est
- * connue. Si l'event "history-loaded" arrive avant Ready, on le met en attente.
+ * Récupère l'historique via invoke (pull, pas push) une fois que l'identité
+ * locale (ME.id) est connue. Invoke est fiable (requête-réponse sync-like),
+ * contrairement à un listen() qui risque de rater l'event si Rust l'émet avant
+ * que le listener JS ne soit enregistré.
  */
-function tryRenderHistory() {
-  if (!pendingHistory || !isReady) return;
-  const history = pendingHistory;
-  pendingHistory = null;
-  if (history.length === 0) return;
-
-  for (const m of history) {
-    seenMessageIds.add(m.id); // dedup anticipé si un doublon live arrive
-    registerPeer(m.senderId);
-    appendMessage(m, { mine: m.senderId === ME.id });
+async function renderHistoryThenSystem(roomName) {
+  try {
+    const history = await invoke("get_history");
+    if (Array.isArray(history) && history.length > 0) {
+      for (const m of history) {
+        registerPeer(m.senderId);
+        // NE PAS pré-ajouter à seenMessageIds : appendMessage le fait lui-même
+        // après sa propre garde de dédup. Sinon, la garde retourne early.
+        appendMessage(m, { mine: m.senderId === ME.id });
+      }
+      appendSeparator("— Nouveaux messages —");
+    }
+  } catch (e) {
+    console.error("[lan-chat] get_history failed:", e);
   }
-  appendSeparator("— Nouveaux messages —");
+  appendSystem(
+    `Connecté au salon « ${roomName} » (chiffré E2E). Découverte mDNS en cours.`
+  );
 }
 
 // ───────────────────────── Envoi ─────────────────────────
@@ -246,13 +253,9 @@ function applyStatus(status) {
       hideOverlay();
       setInputEnabled(true);
 
-      // L'historique (s'il est arrivé) se rend AVANT le message système "Connecté"
-      // pour que l'ordre visuel soit : [ancien] → séparateur → [nouveau]
-      tryRenderHistory();
-
-      appendSystem(
-        `Connecté au salon « ${roomName} » (chiffré E2E). Découverte mDNS en cours.`
-      );
+      // Rend l'historique (invoke async) PUIS le message système "Connecté".
+      // Ordre visuel : [ancien] → séparateur → [Connecté] → [nouveau live].
+      renderHistoryThenSystem(roomName);
     }
     return true;
   }
@@ -330,11 +333,6 @@ listen("chat-message", (event) => {
   registerPeer(msg.senderId);
   if (msg.senderId === ME.id) return; // écho de notre propre publish
   appendMessage(msg, { mine: false });
-});
-
-listen("history-loaded", (event) => {
-  pendingHistory = Array.isArray(event.payload) ? event.payload : [];
-  tryRenderHistory(); // rendra immédiatement si isReady déjà, sinon attendra applyStatus(ready)
 });
 
 listen("node-ready", (event) => {
