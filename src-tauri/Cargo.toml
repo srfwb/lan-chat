@@ -1,9 +1,11 @@
 [package]
 name = "lan-chat"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Zero-config, end-to-end encrypted LAN messenger"
+authors = ["srfwb"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/srfwb/lan-chat"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
