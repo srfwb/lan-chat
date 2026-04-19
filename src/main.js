@@ -52,6 +52,8 @@ const seenMessageIds = new Set();
 let isReady = false;
 let pollToken = 0;
 let hasAcceptedRoom = false;
+let activeSyncs = 0; // nombre de sync d'historique en cours (pour indicator UI)
+let historySeparator = null; // référence DOM du séparateur "— Nouveaux messages —"
 
 // ───────────────────────── DOM ─────────────────────────
 
@@ -71,6 +73,7 @@ const el = {
   roomForm: document.getElementById("room-form"),
   roomInput: document.getElementById("room-code-input"),
   roomError: document.getElementById("room-error"),
+  syncIndicator: document.getElementById("sync-indicator"),
 };
 
 function setStatus(text, variant = "info") {
@@ -115,12 +118,14 @@ function registerPeer(senderId) {
   }
 }
 
-function appendMessage(msg, { mine }) {
-  if (seenMessageIds.has(msg.id)) return;
-  seenMessageIds.add(msg.id);
-
+/**
+ * Construit le noeud DOM d'un message sans l'insérer.
+ * Le dataset.timestamp est exposé pour permettre l'insertion triée par `insertHistoryMessage`.
+ */
+function buildMessageElement(msg, { mine }) {
   const wrapper = document.createElement("div");
   wrapper.className = `message ${mine ? "message--mine" : "message--them"}`;
+  wrapper.dataset.timestamp = String(msg.timestamp);
 
   const avatar = document.createElement("span");
   avatar.className = "message__avatar";
@@ -151,9 +156,47 @@ function appendMessage(msg, { mine }) {
 
   wrapper.appendChild(avatar);
   wrapper.appendChild(bubble);
+  return wrapper;
+}
 
-  el.messages.appendChild(wrapper);
+/** Append à la fin de #messages. Utilisé pour messages live et historique initial. */
+function appendMessage(msg, { mine }) {
+  if (seenMessageIds.has(msg.id)) return;
+  seenMessageIds.add(msg.id);
+  const elem = buildMessageElement(msg, { mine });
+  el.messages.appendChild(elem);
   el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+/**
+ * Insertion d'un message reçu via P2P history sync :
+ * - Si un séparateur "— Nouveaux messages —" existe, on insère AVANT le séparateur,
+ *   à la position chronologique correcte (trié par timestamp).
+ * - Sinon (edge case : sync avant le premier render), append à la fin.
+ */
+function insertHistoryMessage(msg, { mine }) {
+  if (seenMessageIds.has(msg.id)) return;
+  seenMessageIds.add(msg.id);
+  const elem = buildMessageElement(msg, { mine });
+
+  if (!historySeparator || !historySeparator.isConnected) {
+    el.messages.appendChild(elem);
+    el.messages.scrollTop = el.messages.scrollHeight;
+    return;
+  }
+
+  // Walk backward depuis le séparateur jusqu'au premier message avec ts <= msg.timestamp
+  let cursor = historySeparator.previousElementSibling;
+  while (cursor) {
+    const ts = Number(cursor.dataset?.timestamp);
+    if (!Number.isNaN(ts) && ts <= msg.timestamp) {
+      cursor.after(elem);
+      return;
+    }
+    cursor = cursor.previousElementSibling;
+  }
+  // Plus vieux que tout message visible : tout en haut
+  el.messages.insertBefore(elem, el.messages.firstChild);
 }
 
 function appendSystem(text, variant = "info") {
@@ -172,7 +215,13 @@ function appendSeparator(text) {
   span.textContent = text;
   sep.appendChild(span);
   el.messages.appendChild(sep);
+  historySeparator = sep; // ← référence pour l'insertion triée des syncs ultérieures
   el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function updateSyncIndicator() {
+  if (!el.syncIndicator) return;
+  el.syncIndicator.hidden = activeSyncs === 0;
 }
 
 /**
@@ -184,15 +233,18 @@ function appendSeparator(text) {
 async function renderHistoryThenSystem(roomName) {
   try {
     const history = await invoke("get_history");
-    if (Array.isArray(history) && history.length > 0) {
+    const hasHistory = Array.isArray(history) && history.length > 0;
+    if (hasHistory) {
       for (const m of history) {
         registerPeer(m.senderId);
         // NE PAS pré-ajouter à seenMessageIds : appendMessage le fait lui-même
         // après sa propre garde de dédup. Sinon, la garde retourne early.
         appendMessage(m, { mine: m.senderId === ME.id });
       }
-      appendSeparator("— Nouveaux messages —");
     }
+    // Séparateur rendu systématiquement — il sert d'ancre à insertHistoryMessage
+    // lors des syncs P2P ultérieures, même quand l'historique local est vide.
+    appendSeparator(hasHistory ? "— Nouveaux messages —" : "— Début de la session —");
   } catch (e) {
     console.error("[lan-chat] get_history failed:", e);
   }
@@ -249,6 +301,11 @@ function applyStatus(status) {
       el.roomName.textContent = roomName;
       el.roomBadge.hidden = false;
 
+      // Défense : si un sync d'une session précédente n'avait pas émis son "end"
+      // (abort swarm sans LeaveRoom), on nettoie le compteur ici.
+      activeSyncs = 0;
+      updateSyncIndicator();
+
       setStatus(`Salon « ${roomName} » · ${shortPeerId(ME.id)}`, "ready");
       hideOverlay();
       setInputEnabled(true);
@@ -300,7 +357,11 @@ async function onRoomSubmit(e) {
     await invoke("set_room_code", { code });
     hasAcceptedRoom = true;
     hideOverlay();
-    setStatus("Connexion au salon…", "info");
+    // Race possible : le node-ready event peut arriver AVANT que cette ligne
+    // soit atteinte. Ne pas écraser un statut "ready" déjà posé.
+    if (!isReady) {
+      setStatus("Connexion au salon…", "info");
+    }
     pollStatus();
   } catch (err) {
     console.error("[lan-chat] set_room_code failed:", err);
@@ -310,20 +371,36 @@ async function onRoomSubmit(e) {
 
 async function onChangeRoom() {
   const ok = confirm(
-    "Changer de salon supprime ta config locale. Tu devras relancer l'app pour choisir un nouveau code. Continuer ?"
+    "Changer de salon ? L'historique du salon actuel est conservé sur cette machine — tu pourras y revenir en retapant le même code."
   );
   if (!ok) return;
   try {
-    await invoke("reset_room");
-    setStatus("Salon effacé. Relance l'app pour en choisir un nouveau.", "warn");
-    appendSystem(
-      "Salon effacé. Ferme et relance l'app pour rejoindre un autre salon.",
-      "info"
-    );
-    setInputEnabled(false);
+    await invoke("leave_room");
+    // Le listener node-awaiting-room s'occupe du reset UI + affichage de l'overlay
   } catch (err) {
-    appendSystem(`Erreur reset_room : ${err}`, "error");
+    appendSystem(`Erreur leave_room : ${err}`, "error");
   }
+}
+
+/**
+ * Reset complet de l'UI quand le swarm est abandonné (leave_room).
+ * Appelé à la réception de l'event node-awaiting-room après le départ du salon.
+ */
+function resetUiForAwaitingRoom() {
+  el.messages.innerHTML = "";
+  seenMessageIds.clear();
+  seenPeers.clear();
+  el.peersCount.textContent = "0";
+  el.roomBadge.hidden = true;
+  el.roomName.textContent = "—";
+  isReady = false;
+  ME.id = null;
+  hasAcceptedRoom = false;
+  el.meAvatar.style.background = "";
+  setInputEnabled(false);
+  historySeparator = null;
+  activeSyncs = 0;
+  updateSyncIndicator();
 }
 
 // ───────────────────────── Événements Tauri ─────────────────────────
@@ -333,6 +410,23 @@ listen("chat-message", (event) => {
   registerPeer(msg.senderId);
   if (msg.senderId === ME.id) return; // écho de notre propre publish
   appendMessage(msg, { mine: false });
+});
+
+// Message reçu via P2P history sync : insertion triée par timestamp avant le séparateur.
+listen("history-message", (event) => {
+  const msg = event.payload;
+  registerPeer(msg.senderId);
+  insertHistoryMessage(msg, { mine: msg.senderId === ME.id });
+});
+
+listen("history-sync-start", () => {
+  activeSyncs++;
+  updateSyncIndicator();
+});
+
+listen("history-sync-end", () => {
+  activeSyncs = Math.max(0, activeSyncs - 1);
+  updateSyncIndicator();
 });
 
 listen("node-ready", (event) => {
@@ -345,7 +439,11 @@ listen("node-ready", (event) => {
 });
 
 listen("node-awaiting-room", () => {
+  resetUiForAwaitingRoom();
   applyStatus({ kind: "awaitingRoom" });
+  // Relance le polling pour détecter le prochain Ready quand l'utilisateur
+  // soumettra un nouveau code (le polling précédent a rendu true sur awaitingRoom).
+  pollStatus();
 });
 
 listen("node-error", (event) => {

@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -13,15 +13,15 @@ use chacha20poly1305::{
 };
 use futures::stream::StreamExt;
 use libp2p::{
-    gossipsub, identity, mdns, noise,
+    gossipsub, identity, mdns, noise, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, SwarmBuilder,
+    tcp, yamux, PeerId, StreamProtocol, SwarmBuilder,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager};
-use tokio::{io, select, sync::mpsc, sync::oneshot};
+use tauri::{async_runtime::JoinHandle, AppHandle, Emitter, Manager};
+use tokio::{io, select, sync::mpsc};
 
 const APP_TAG: &str = "lan-chat-v1";
 
@@ -31,6 +31,22 @@ const APP_TAG: &str = "lan-chat-v1";
 struct ChatBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    history_sync: request_response::json::Behaviour<HistoryRequest, HistoryResponse>,
+}
+
+const HISTORY_SYNC_PROTOCOL: &str = "/lan-chat/history-sync/1";
+
+// ───────────────────────── Types wire pour la sync d'historique ─────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct HistoryRequest {
+    version: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct HistoryResponse {
+    version: u32,
+    messages: Vec<EncryptedEnvelope>,
 }
 
 // ───────────────────────── Modèles ─────────────────────────
@@ -46,7 +62,7 @@ struct ChatMessage {
 }
 
 /// Enveloppe chiffrée publiée sur gossipsub : jamais de clair sur le réseau.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct EncryptedEnvelope {
     /// Nonce 12 octets (base64).
     n: String,
@@ -83,7 +99,14 @@ struct NodeReadyPayload {
     room_name: String,
 }
 
-// ───────────────────────── État partagé ─────────────────────────
+/// Commandes envoyées à la task coordinatrice du swarm.
+/// Permet le switch de salon à chaud : on abort le swarm courant et on en relance un nouveau.
+enum ManagerCmd {
+    StartRoom(RoomConfig),
+    LeaveRoom,
+}
+
+// ───────────────────────── État partagé (cells réinitialisables) ─────────────────────────
 
 fn node_state() -> &'static Mutex<NodeStatus> {
     static STATE: OnceLock<Mutex<NodeStatus>> = OnceLock::new();
@@ -96,13 +119,35 @@ fn set_node_status(status: NodeStatus) {
     }
 }
 
-static PUBLISHER_TX: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
-static ROOM_SETUP_TX: OnceLock<Mutex<Option<oneshot::Sender<RoomConfig>>>> = OnceLock::new();
+static HISTORY: OnceLock<Mutex<Option<VecDeque<ChatMessage>>>> = OnceLock::new();
+static HISTORY_STORE: OnceLock<Mutex<Option<Arc<HistoryStore>>>> = OnceLock::new();
+static PUBLISHER_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<ChatMessage>>>> = OnceLock::new();
+static MANAGER_TX: OnceLock<mpsc::UnboundedSender<ManagerCmd>> = OnceLock::new();
 
-fn take_room_setup_tx() -> Option<oneshot::Sender<RoomConfig>> {
-    let cell = ROOM_SETUP_TX.get()?;
-    let mut guard = cell.lock().ok()?;
-    guard.take()
+fn history_cell() -> &'static Mutex<Option<VecDeque<ChatMessage>>> {
+    HISTORY.get_or_init(|| Mutex::new(None))
+}
+
+fn history_store_cell() -> &'static Mutex<Option<Arc<HistoryStore>>> {
+    HISTORY_STORE.get_or_init(|| Mutex::new(None))
+}
+
+fn publisher_tx_cell() -> &'static Mutex<Option<mpsc::UnboundedSender<ChatMessage>>> {
+    PUBLISHER_TX.get_or_init(|| Mutex::new(None))
+}
+
+/// Vide toutes les ressources partagées liées à un salon (appelée lors d'un StartRoom ou LeaveRoom).
+/// Le swarm précédent a été aborted juste avant ; son Drop ferme TCP/mDNS.
+fn clear_shared_state() {
+    if let Ok(mut g) = history_cell().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = history_store_cell().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = publisher_tx_cell().lock() {
+        *g = None;
+    }
 }
 
 // ───────────────────────── Identité persistante ─────────────────────────
@@ -193,9 +238,6 @@ fn derive_room(code: &str) -> (String, [u8; 32]) {
 
 const HISTORY_CAP: usize = 500;
 const HISTORY_FILE_VERSION: u32 = 1;
-
-static HISTORY: OnceLock<Mutex<VecDeque<ChatMessage>>> = OnceLock::new();
-static HISTORY_STORE: OnceLock<Arc<HistoryStore>> = OnceLock::new();
 
 struct HistoryStore {
     path: PathBuf,
@@ -303,23 +345,26 @@ impl HistoryStore {
 }
 
 fn history_path_for(app_data: &Path, topic: &str) -> PathBuf {
-    // topic est "lan-chat-v1-XXXXXXXXXXXXXXXX" (16 hex) ; on garde la partie hash
     let hash_part = topic.strip_prefix(concat!("lan-chat-v1", "-")).unwrap_or(topic);
     app_data.join("history").join(format!("{}.bin", hash_part))
 }
 
 /// Ajoute un message à l'historique en mémoire et persiste (best-effort).
-/// Silencieux si HISTORY ou HISTORY_STORE ne sont pas encore initialisés
-/// (cas improbable : appelé uniquement après démarrage du swarm).
-fn append_to_history(msg: ChatMessage) {
-    let Some(hist_lock) = HISTORY.get() else { return };
-    let Some(store) = HISTORY_STORE.get() else { return };
-
+/// Retourne true si le message a été ajouté (nouveau) ou false s'il était déjà présent
+/// (dédup par ID) ou si les stores ne sont pas initialisés.
+fn append_to_history_if_new(msg: ChatMessage) -> bool {
     let snapshot = {
-        let mut hist = match hist_lock.lock() {
+        let mut guard = match history_cell().lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => return false,
         };
+        let hist = match guard.as_mut() {
+            Some(h) => h,
+            None => return false,
+        };
+        if hist.iter().any(|m| m.id == msg.id) {
+            return false;
+        }
         hist.push_back(msg);
         while hist.len() > HISTORY_CAP {
             hist.pop_front();
@@ -327,9 +372,102 @@ fn append_to_history(msg: ChatMessage) {
         hist.clone()
     };
 
-    if let Err(e) = store.save(&snapshot) {
-        eprintln!("[lan-chat] History save error: {}", e);
+    let store = match history_store_cell().lock() {
+        Ok(g) => g.as_ref().cloned(),
+        Err(_) => None,
+    };
+    if let Some(store) = store {
+        if let Err(e) = store.save(&snapshot) {
+            eprintln!("[lan-chat] History save error: {}", e);
+        }
     }
+    true
+}
+
+/// Alias compat pour l'appel dans `send_message` : on jette le bool.
+fn append_to_history(msg: ChatMessage) {
+    let _ = append_to_history_if_new(msg);
+}
+
+// ───────────────────────── Chiffrement helpers (factorisé) ─────────────────────────
+
+fn encrypt_chat_message(cipher: &ChaCha20Poly1305, msg: &ChatMessage) -> Option<EncryptedEnvelope> {
+    let json = serde_json::to_vec(msg).ok()?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher.encrypt(nonce, json.as_slice()).ok()?;
+    Some(EncryptedEnvelope {
+        n: B64.encode(nonce_bytes),
+        c: B64.encode(&ct),
+    })
+}
+
+fn decrypt_envelope(cipher: &ChaCha20Poly1305, env: &EncryptedEnvelope) -> Option<ChatMessage> {
+    let nonce_bytes = B64.decode(&env.n).ok()?;
+    if nonce_bytes.len() != 12 {
+        return None;
+    }
+    let ct = B64.decode(&env.c).ok()?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = cipher.decrypt(nonce, ct.as_slice()).ok()?;
+    serde_json::from_slice::<ChatMessage>(&plaintext).ok()
+}
+
+// ───────────────────────── Sync d'historique P2P ─────────────────────────
+
+fn build_history_response(cipher: &ChaCha20Poly1305) -> HistoryResponse {
+    let messages: Vec<ChatMessage> = history_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.iter().cloned().collect()))
+        .unwrap_or_default();
+
+    let envelopes: Vec<EncryptedEnvelope> = messages
+        .iter()
+        .filter_map(|m| encrypt_chat_message(cipher, m))
+        .collect();
+
+    HistoryResponse {
+        version: 1,
+        messages: envelopes,
+    }
+}
+
+fn ingest_history_response(
+    cipher: &ChaCha20Poly1305,
+    response: HistoryResponse,
+    app: &AppHandle,
+) {
+    if response.version != 1 {
+        eprintln!(
+            "[lan-chat] Ignoring history-sync response (unsupported version {})",
+            response.version
+        );
+        return;
+    }
+    let total = response.messages.len();
+    let mut ingested = 0usize;
+    let mut dup = 0usize;
+    let mut decrypt_failed = 0usize;
+    for envelope in response.messages {
+        match decrypt_envelope(cipher, &envelope) {
+            Some(msg) => {
+                if append_to_history_if_new(msg.clone()) {
+                    ingested += 1;
+                    // Event dédié : le frontend insère en ordre chronologique avant le séparateur.
+                    let _ = app.emit("history-message", msg);
+                } else {
+                    dup += 1;
+                }
+            }
+            None => decrypt_failed += 1,
+        }
+    }
+    eprintln!(
+        "[lan-chat] History ingest: {} received → {} new, {} dup, {} decrypt-failed",
+        total, ingested, dup, decrypt_failed
+    );
 }
 
 // ───────────────────────── Commandes Tauri ─────────────────────────
@@ -369,39 +507,55 @@ fn set_room_code(app: AppHandle, code: String) -> Result<(), String> {
         return Err("Code de salon trop long (max 120 caractères).".into());
     }
 
-    // On consomme le Sender AVANT de persister pour éviter d'écraser
-    // room.json avec un code qui ne sera jamais utilisé (2e appel = déjà actif).
-    let tx = take_room_setup_tx().ok_or_else(|| {
-        "Le salon est déjà actif. Utilise 'reset_room' puis relance l'application.".to_string()
-    })?;
-
     let config = RoomConfig {
         version: 1,
         code: trimmed.to_string(),
     };
     save_room_config(&app, &config).map_err(|e| format!("Écriture de room.json : {}", e))?;
 
-    // Transitionne le statut avant que le swarm soit prêt, pour que le frontend
-    // ne repoll pas "awaitingRoom" et ne réaffiche pas l'overlay.
-    set_node_status(NodeStatus::Initializing);
+    MANAGER_TX
+        .get()
+        .ok_or_else(|| "Manager non initialisé".to_string())?
+        .send(ManagerCmd::StartRoom(config))
+        .map_err(|e| format!("Canal manager fermé : {}", e))?;
 
-    let _ = tx.send(config);
+    // Le manager transitionne vers Initializing puis Ready ; on ne touche pas
+    // au status ici pour éviter de clobber un Ready déjà posé (même race que le
+    // fix frontend da4de6b).
     Ok(())
 }
 
 #[tauri::command]
-fn reset_room(app: AppHandle) -> Result<(), String> {
+fn leave_room(app: AppHandle) -> Result<(), String> {
     delete_room_config(&app).map_err(|e| format!("Suppression de room.json : {}", e))?;
+    MANAGER_TX
+        .get()
+        .ok_or_else(|| "Manager non initialisé".to_string())?
+        .send(ManagerCmd::LeaveRoom)
+        .map_err(|e| format!("Canal manager fermé : {}", e))?;
     Ok(())
+}
+
+/// Legacy alias : le frontend d'anciennes versions appelait reset_room.
+/// Dans la nouvelle version, c'est équivalent à leave_room.
+#[tauri::command]
+fn reset_room(app: AppHandle) -> Result<(), String> {
+    leave_room(app)
 }
 
 #[tauri::command]
 fn send_message(message: ChatMessage) -> Result<(), String> {
-    let tx = PUBLISHER_TX
-        .get()
-        .ok_or_else(|| "Publisher non initialisé".to_string())?;
-    let json = serde_json::to_string(&message).map_err(|e| e.to_string())?;
-    tx.send(json).map_err(|e| format!("Échec d'envoi : {}", e))?;
+    let tx = {
+        let guard = publisher_tx_cell()
+            .lock()
+            .map_err(|_| "Publisher lock empoisonné".to_string())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Publisher non initialisé".to_string())?
+    };
+    tx.send(message.clone())
+        .map_err(|e| format!("Échec d'envoi : {}", e))?;
     // Archive immédiate de notre propre message (gossipsub ne nous le renvoie pas)
     append_to_history(message);
     Ok(())
@@ -409,20 +563,27 @@ fn send_message(message: ChatMessage) -> Result<(), String> {
 
 #[tauri::command]
 fn get_history() -> Vec<ChatMessage> {
-    HISTORY
-        .get()
-        .and_then(|m| m.lock().ok().map(|g| g.iter().cloned().collect()))
-        .unwrap_or_default()
+    let mut messages: Vec<ChatMessage> = history_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.iter().cloned().collect()))
+        .unwrap_or_default();
+    // Tri par timestamp : la deque peut être désordonnée après des syncs P2P
+    // (append_to_history_if_new fait un push_back, pas une insertion triée).
+    messages.sort_by_key(|m| m.timestamp);
+    messages
 }
 
 #[tauri::command]
 fn clear_history() -> Result<(), String> {
-    let store = HISTORY_STORE
-        .get()
-        .ok_or_else(|| "Store non initialisé".to_string())?;
-    if let Some(hist_lock) = HISTORY.get() {
-        if let Ok(mut g) = hist_lock.lock() {
-            g.clear();
+    let store = match history_store_cell().lock() {
+        Ok(g) => g.as_ref().cloned(),
+        Err(_) => None,
+    };
+    let store = store.ok_or_else(|| "Store non initialisé".to_string())?;
+    if let Ok(mut g) = history_cell().lock() {
+        if let Some(h) = g.as_mut() {
+            h.clear();
         }
     }
     store.clear()
@@ -432,7 +593,7 @@ fn clear_history() -> Result<(), String> {
 
 async fn run_swarm(
     app: AppHandle,
-    mut rx: mpsc::UnboundedReceiver<String>,
+    mut rx: mpsc::UnboundedReceiver<ChatMessage>,
     keypair: identity::Keypair,
     room: RoomConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -440,7 +601,7 @@ async fn run_swarm(
     let cipher = ChaCha20Poly1305::new_from_slice(&key_bytes)
         .map_err(|e| format!("Initialisation du chiffrement échouée : {}", e))?;
 
-    // Historique chiffré : chemin par salon, clone du cipher pour (dé)chiffrement.
+    // Historique chiffré : chemin par salon, clé brute (cipher reconstruit à la demande).
     let app_data = app
         .path()
         .app_data_dir()
@@ -455,9 +616,14 @@ async fn run_swarm(
         loaded_history.len(),
         history_store.path.display()
     );
-    let _ = HISTORY.set(Mutex::new(VecDeque::from(loaded_history)));
-    let _ = HISTORY_STORE.set(history_store);
-    // Le frontend récupère l'historique via invoke("get_history") dans applyStatus(ready).
+
+    // Publie dans les cells (overwrite si déjà set par un run précédent).
+    if let Ok(mut g) = history_cell().lock() {
+        *g = Some(VecDeque::from(loaded_history));
+    }
+    if let Ok(mut g) = history_store_cell().lock() {
+        *g = Some(history_store);
+    }
 
     let topic_for_builder = topic_str.clone();
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -468,7 +634,6 @@ async fn run_swarm(
             yamux::Config::default,
         )?
         .with_behaviour(move |key| {
-            // ID dérivé du hash du contenu → déduplication gossipsub
             let message_id_fn = |message: &gossipsub::Message| {
                 let mut s = DefaultHasher::new();
                 message.data.hash(&mut s);
@@ -498,7 +663,19 @@ async fn run_swarm(
                 key.public().to_peer_id(),
             )?;
 
-            Ok(ChatBehaviour { gossipsub, mdns })
+            let history_sync = request_response::json::Behaviour::<HistoryRequest, HistoryResponse>::new(
+                [(
+                    StreamProtocol::new(HISTORY_SYNC_PROTOCOL),
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default(),
+            );
+
+            Ok(ChatBehaviour {
+                gossipsub,
+                mdns,
+                history_sync,
+            })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -520,32 +697,26 @@ async fn run_swarm(
 
     let topic = gossipsub::IdentTopic::new(topic_str.as_str());
 
+    // Tracké par run_swarm : un seul sync par pair par session.
+    // Reset implicite à chaque restart du swarm (cette variable est locale).
+    let mut synced_peers: HashSet<PeerId> = HashSet::new();
+
     loop {
         select! {
-            maybe_json = rx.recv() => {
-                match maybe_json {
-                    Some(plaintext) => {
-                        // Chiffrement avant publication
-                        let mut nonce_bytes = [0u8; 12];
-                        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-                        let nonce = Nonce::from_slice(&nonce_bytes);
-
-                        match cipher.encrypt(nonce, plaintext.as_bytes()) {
-                            Ok(ct) => {
-                                let envelope = EncryptedEnvelope {
-                                    n: B64.encode(nonce_bytes),
-                                    c: B64.encode(&ct),
-                                };
-                                match serde_json::to_vec(&envelope) {
-                                    Ok(wire) => {
-                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire) {
-                                            eprintln!("[lan-chat] Publish error: {}", e);
-                                        }
+            maybe_msg = rx.recv() => {
+                match maybe_msg {
+                    Some(message) => {
+                        if let Some(envelope) = encrypt_chat_message(&cipher, &message) {
+                            match serde_json::to_vec(&envelope) {
+                                Ok(wire) => {
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire) {
+                                        eprintln!("[lan-chat] Publish error: {}", e);
                                     }
-                                    Err(e) => eprintln!("[lan-chat] Envelope serialize error: {}", e),
                                 }
+                                Err(e) => eprintln!("[lan-chat] Envelope serialize error: {}", e),
                             }
-                            Err(e) => eprintln!("[lan-chat] Encrypt error: {}", e),
+                        } else {
+                            eprintln!("[lan-chat] Failed to encrypt outgoing message");
                         }
                     }
                     None => break,
@@ -557,6 +728,14 @@ async fn run_swarm(
                         for (peer, _addr) in list {
                             eprintln!("[lan-chat] mDNS discovered: {}", peer);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                            // Sync d'historique : une seule fois par pair par session.
+                            if synced_peers.insert(peer) {
+                                swarm
+                                    .behaviour_mut()
+                                    .history_sync
+                                    .send_request(&peer, HistoryRequest { version: 1 });
+                                let _ = app.emit("history-sync-start", peer.to_string());
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
@@ -566,29 +745,59 @@ async fn run_swarm(
                         }
                     }
                     SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
-                        // Décryptage silencieux : une enveloppe illisible = salon différent ou tampering
                         let envelope = match serde_json::from_slice::<EncryptedEnvelope>(&message.data) {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
-                        let nonce_vec = match B64.decode(&envelope.n) {
-                            Ok(v) if v.len() == 12 => v,
-                            _ => continue,
-                        };
-                        let ct = match B64.decode(&envelope.c) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        let nonce = Nonce::from_slice(&nonce_vec);
-                        let plaintext = match cipher.decrypt(nonce, ct.as_slice()) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        if let Ok(text) = std::str::from_utf8(&plaintext) {
-                            if let Ok(msg) = serde_json::from_str::<ChatMessage>(text) {
-                                append_to_history(msg.clone());
+                        if let Some(msg) = decrypt_envelope(&cipher, &envelope) {
+                            if append_to_history_if_new(msg.clone()) {
                                 let _ = app.emit("chat-message", msg);
                             }
+                        }
+                    }
+                    SwarmEvent::Behaviour(ChatBehaviourEvent::HistorySync(ev)) => {
+                        match ev {
+                            request_response::Event::Message { peer, message, .. } => {
+                                match message {
+                                    request_response::Message::Request { request, channel, .. } => {
+                                        if request.version == 1 {
+                                            let response = build_history_response(&cipher);
+                                            eprintln!(
+                                                "[lan-chat] Sending {} msg(s) in history-sync response to {}",
+                                                response.messages.len(),
+                                                peer
+                                            );
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .history_sync
+                                                .send_response(channel, response);
+                                        } else {
+                                            eprintln!(
+                                                "[lan-chat] Ignoring history-sync request from {} (unsupported version {})",
+                                                peer, request.version
+                                            );
+                                            // channel est drop → le pair recevra ResponseOmission
+                                        }
+                                    }
+                                    request_response::Message::Response { response, .. } => {
+                                        eprintln!(
+                                            "[lan-chat] Received {} msg(s) in history-sync response from {}",
+                                            response.messages.len(),
+                                            peer
+                                        );
+                                        ingest_history_response(&cipher, response, &app);
+                                        let _ = app.emit("history-sync-end", peer.to_string());
+                                    }
+                                }
+                            }
+                            request_response::Event::OutboundFailure { peer, error, .. } => {
+                                eprintln!("[lan-chat] History sync outbound failure to {}: {}", peer, error);
+                                let _ = app.emit("history-sync-end", peer.to_string());
+                            }
+                            request_response::Event::InboundFailure { peer, error, .. } => {
+                                eprintln!("[lan-chat] History sync inbound failure from {}: {}", peer, error);
+                            }
+                            request_response::Event::ResponseSent { .. } => {}
                         }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -614,6 +823,7 @@ pub fn run() {
             get_node_status,
             get_room_status,
             set_room_code,
+            leave_room,
             reset_room,
             send_message,
             get_history,
@@ -622,13 +832,7 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let (pub_tx, pub_rx) = mpsc::unbounded_channel::<String>();
-            let _ = PUBLISHER_TX.set(pub_tx);
-
-            let (room_tx, room_rx) = oneshot::channel::<RoomConfig>();
-            let _ = ROOM_SETUP_TX.set(Mutex::new(Some(room_tx)));
-
-            // Identité ed25519 persistante (chargée ou créée) — synchrone, avant le spawn
+            // Identité ed25519 persistante, chargée avant de spawn le manager.
             let keypair = match load_or_create_identity(&handle) {
                 Ok(kp) => kp,
                 Err(e) => {
@@ -642,40 +846,68 @@ pub fn run() {
                 }
             };
 
+            // Canal multi-commande pour orchestrer le cycle de vie du swarm.
+            let (manager_tx, mut manager_rx) = mpsc::unbounded_channel::<ManagerCmd>();
+            let _ = MANAGER_TX.set(manager_tx);
+
             tauri::async_runtime::spawn(async move {
-                // Si un salon est déjà configuré, on l'utilise. Sinon, on attend que l'utilisateur
-                // en fournisse un via set_room_code (via l'overlay du frontend).
-                let room_config = match load_room_config(&handle) {
+                let mut current: Option<JoinHandle<()>> = None;
+
+                // Auto-start si un room.json existe. Sinon on passe en AwaitingRoom.
+                match load_room_config(&handle) {
                     Some(cfg) => {
                         eprintln!(
-                            "[lan-chat] Existing room config found: code=\"{}\" — skipping overlay",
+                            "[lan-chat] Existing room config found: code=\"{}\" — auto-starting",
                             cfg.code
                         );
-                        // Le salon existe déjà → on consomme le Sender pour qu'il ne traîne pas.
-                        let _ = take_room_setup_tx();
-                        cfg
+                        let _ = MANAGER_TX.get().unwrap().send(ManagerCmd::StartRoom(cfg));
                     }
                     None => {
                         eprintln!("[lan-chat] No room config — awaiting user input via overlay");
                         set_node_status(NodeStatus::AwaitingRoom);
                         let _ = handle.emit("node-awaiting-room", ());
-                        match room_rx.await {
-                            Ok(cfg) => cfg,
-                            Err(_) => {
-                                eprintln!("[lan-chat] Room setup channel closed before use");
-                                return;
+                    }
+                }
+
+                while let Some(cmd) = manager_rx.recv().await {
+                    match cmd {
+                        ManagerCmd::StartRoom(config) => {
+                            eprintln!("[lan-chat] Manager: StartRoom(\"{}\")", config.code);
+                            if let Some(h) = current.take() {
+                                h.abort();
                             }
+                            clear_shared_state();
+                            set_node_status(NodeStatus::Initializing);
+
+                            // Nouveau canal publisher par run (les anciens Sender sont détachés).
+                            let (pub_tx, pub_rx) = mpsc::unbounded_channel::<ChatMessage>();
+                            if let Ok(mut g) = publisher_tx_cell().lock() {
+                                *g = Some(pub_tx);
+                            }
+
+                            let h_app = handle.clone();
+                            let kp = keypair.clone();
+                            current = Some(tauri::async_runtime::spawn(async move {
+                                if let Err(e) = run_swarm(h_app.clone(), pub_rx, kp, config).await {
+                                    let msg = format!("Erreur libp2p : {}", e);
+                                    eprintln!("[lan-chat] {}", msg);
+                                    set_node_status(NodeStatus::Error {
+                                        message: msg.clone(),
+                                    });
+                                    let _ = h_app.emit("node-error", msg);
+                                }
+                            }));
+                        }
+                        ManagerCmd::LeaveRoom => {
+                            eprintln!("[lan-chat] Manager: LeaveRoom");
+                            if let Some(h) = current.take() {
+                                h.abort();
+                            }
+                            clear_shared_state();
+                            set_node_status(NodeStatus::AwaitingRoom);
+                            let _ = handle.emit("node-awaiting-room", ());
                         }
                     }
-                };
-
-                if let Err(e) = run_swarm(handle.clone(), pub_rx, keypair, room_config).await {
-                    let msg = format!("Erreur libp2p : {}", e);
-                    eprintln!("[lan-chat] {}", msg);
-                    set_node_status(NodeStatus::Error {
-                        message: msg.clone(),
-                    });
-                    let _ = handle.emit("node-error", msg);
                 }
             });
 
