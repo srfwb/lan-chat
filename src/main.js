@@ -300,7 +300,11 @@ async function onRoomSubmit(e) {
     await invoke("set_room_code", { code });
     hasAcceptedRoom = true;
     hideOverlay();
-    setStatus("Connexion au salon…", "info");
+    // Race possible : le node-ready event peut arriver AVANT que cette ligne
+    // soit atteinte. Ne pas écraser un statut "ready" déjà posé.
+    if (!isReady) {
+      setStatus("Connexion au salon…", "info");
+    }
     pollStatus();
   } catch (err) {
     console.error("[lan-chat] set_room_code failed:", err);
