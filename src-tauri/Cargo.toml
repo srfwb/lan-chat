@@ -1,6 +1,6 @@
 [package]
 name = "lan-chat"
-version = "0.2.0"
+version = "0.2.1"
 description = "Zero-config, end-to-end encrypted LAN messenger"
 authors = ["srfwb"]
 edition = "2021"
