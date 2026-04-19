@@ -39,4 +39,6 @@ libp2p = { version = "0.55", features = [
     "tcp",
     "yamux",
     "ed25519",
+    "request-response",
+    "json",
 ] }
