@@ -158,8 +158,14 @@ pub async fn run_swarm(
 
     let topic = gossipsub::IdentTopic::new(topic_str.as_str());
 
-    // Un seul sync d'historique par pair par session (reset implicite au respawn du swarm).
-    let mut synced_peers: HashSet<PeerId> = HashSet::new();
+    // Machine d'état 2-phases pour la sync d'historique :
+    // - `pending_sync` : pairs mDNS à synchroniser dès qu'une connexion est établie
+    //   (déclencher `send_request` sur `ConnectionEstablished` garantit que le dial
+    //   a réussi — cf. historique : le dial immédiat depuis `mDNS Discovered` peut
+    //   rater sur adaptateurs virtuels, et on n'avait aucun retry).
+    // - `synced`       : pairs pour lesquels on a reçu une réponse → ne pas re-sync.
+    let mut pending_sync: HashSet<PeerId> = HashSet::new();
+    let mut synced: HashSet<PeerId> = HashSet::new();
 
     loop {
         select! {
@@ -191,7 +197,7 @@ pub async fn run_swarm(
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &cipher, &app, &mut synced_peers);
+                handle_swarm_event(event, &mut swarm, &cipher, &app, &mut pending_sync, &mut synced);
             }
         }
     }
@@ -199,27 +205,53 @@ pub async fn run_swarm(
     Ok(())
 }
 
+fn trigger_history_sync(
+    swarm: &mut libp2p::Swarm<ChatBehaviour>,
+    app: &AppHandle,
+    peer: &PeerId,
+) {
+    swarm
+        .behaviour_mut()
+        .history_sync
+        .send_request(peer, HistoryRequest { version: 1 });
+    let _ = app.emit("history-sync-start", peer.to_string());
+}
+
 fn handle_swarm_event(
     event: SwarmEvent<ChatBehaviourEvent>,
     swarm: &mut libp2p::Swarm<ChatBehaviour>,
     cipher: &ChaCha20Poly1305,
     app: &AppHandle,
-    synced_peers: &mut HashSet<PeerId>,
+    pending_sync: &mut HashSet<PeerId>,
+    synced: &mut HashSet<PeerId>,
 ) {
     match event {
         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer, _addr) in list {
                 eprintln!("[lan-chat] mDNS discovered: {}", peer);
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
-                if synced_peers.insert(peer) {
-                    swarm
-                        .behaviour_mut()
-                        .history_sync
-                        .send_request(&peer, HistoryRequest { version: 1 });
-                    let _ = app.emit("history-sync-start", peer.to_string());
+                if synced.contains(&peer) {
+                    continue;
+                }
+                if swarm.is_connected(&peer) {
+                    // Connexion déjà établie (peer-initiated ou re-discovery) — sync immédiat.
+                    trigger_history_sync(swarm, app, &peer);
+                } else {
+                    // Sinon, on attend ConnectionEstablished pour déclencher le sync.
+                    pending_sync.insert(peer);
                 }
             }
         }
+        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            eprintln!("[lan-chat] Connection established with {}", peer_id);
+            if pending_sync.remove(&peer_id) {
+                trigger_history_sync(swarm, app, &peer_id);
+            }
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
+            Some(p) => eprintln!("[lan-chat] Outgoing connection error to {}: {}", p, error),
+            None => eprintln!("[lan-chat] Outgoing connection error (unknown peer): {}", error),
+        },
         SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
             for (peer, _addr) in list {
                 eprintln!("[lan-chat] mDNS expired: {}", peer);
@@ -333,6 +365,8 @@ fn handle_swarm_event(
                     );
                     ingest_history_response(cipher, response, app);
                     let _ = app.emit("history-sync-end", peer.to_string());
+                    synced.insert(peer);
+                    pending_sync.remove(&peer);
                 }
             },
             request_response::Event::OutboundFailure { peer, error, .. } => {
@@ -341,6 +375,10 @@ fn handle_swarm_event(
                     peer, error
                 );
                 let _ = app.emit("history-sync-end", peer.to_string());
+                // Retry sur la prochaine connexion établie (évite le "1 shot silencieux").
+                if !synced.contains(&peer) {
+                    pending_sync.insert(peer);
+                }
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 eprintln!(
