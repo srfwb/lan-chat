@@ -1,8 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -188,6 +189,149 @@ fn derive_room(code: &str) -> (String, [u8; 32]) {
     (topic, key)
 }
 
+// ───────────────────────── Historique chiffré ─────────────────────────
+
+const HISTORY_CAP: usize = 500;
+const HISTORY_FILE_VERSION: u32 = 1;
+
+static HISTORY: OnceLock<Mutex<VecDeque<ChatMessage>>> = OnceLock::new();
+static HISTORY_STORE: OnceLock<Arc<HistoryStore>> = OnceLock::new();
+
+struct HistoryStore {
+    path: PathBuf,
+    key: [u8; 32], // on garde la clé brute ; le cipher est reconstruit à la demande
+}
+
+#[derive(Serialize)]
+struct HistoryFilePayloadOut<'a> {
+    version: u32,
+    messages: &'a VecDeque<ChatMessage>,
+}
+
+#[derive(Deserialize)]
+struct HistoryFilePayloadIn {
+    #[allow(dead_code)]
+    version: u32,
+    messages: Vec<ChatMessage>,
+}
+
+impl HistoryStore {
+    fn new(path: PathBuf, key: [u8; 32]) -> Self {
+        Self { path, key }
+    }
+
+    fn cipher(&self) -> Result<ChaCha20Poly1305, String> {
+        ChaCha20Poly1305::new_from_slice(&self.key).map_err(|e| e.to_string())
+    }
+
+    /// Charge l'historique depuis le disque (tolérant : renvoie Vec vide sur erreur).
+    fn load(&self) -> Vec<ChatMessage> {
+        if !self.path.exists() {
+            return Vec::new();
+        }
+        let cipher = match self.cipher() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[lan-chat] History cipher init error: {}", e);
+                return Vec::new();
+            }
+        };
+        let bytes = match fs::read(&self.path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[lan-chat] History read error: {}", e);
+                return Vec::new();
+            }
+        };
+        if bytes.len() < 12 {
+            eprintln!("[lan-chat] History file too small (<12 bytes)");
+            return Vec::new();
+        }
+        let (nonce_bytes, ct) = bytes.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = match cipher.decrypt(nonce, ct) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("[lan-chat] History decrypt failed (wrong key or tampered file)");
+                return Vec::new();
+            }
+        };
+        match serde_json::from_slice::<HistoryFilePayloadIn>(&plaintext) {
+            Ok(p) => p.messages,
+            Err(e) => {
+                eprintln!("[lan-chat] History parse error: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Chiffre et écrit l'historique complet sur disque (atomic via rename).
+    fn save(&self, messages: &VecDeque<ChatMessage>) -> Result<(), String> {
+        let cipher = self.cipher()?;
+        let payload = HistoryFilePayloadOut {
+            version: HISTORY_FILE_VERSION,
+            messages,
+        };
+        let json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(nonce, json.as_slice())
+            .map_err(|e| format!("encrypt history: {}", e))?;
+
+        let mut file_bytes = Vec::with_capacity(12 + ct.len());
+        file_bytes.extend_from_slice(&nonce_bytes);
+        file_bytes.extend_from_slice(&ct);
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let tmp = self.path.with_extension("bin.tmp");
+        fs::write(&tmp, &file_bytes).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        if self.path.exists() {
+            fs::remove_file(&self.path).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+fn history_path_for(app_data: &Path, topic: &str) -> PathBuf {
+    // topic est "lan-chat-v1-XXXXXXXXXXXXXXXX" (16 hex) ; on garde la partie hash
+    let hash_part = topic.strip_prefix(concat!("lan-chat-v1", "-")).unwrap_or(topic);
+    app_data.join("history").join(format!("{}.bin", hash_part))
+}
+
+/// Ajoute un message à l'historique en mémoire et persiste (best-effort).
+/// Silencieux si HISTORY ou HISTORY_STORE ne sont pas encore initialisés
+/// (cas improbable : appelé uniquement après démarrage du swarm).
+fn append_to_history(msg: ChatMessage) {
+    let Some(hist_lock) = HISTORY.get() else { return };
+    let Some(store) = HISTORY_STORE.get() else { return };
+
+    let snapshot = {
+        let mut hist = match hist_lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        hist.push_back(msg);
+        while hist.len() > HISTORY_CAP {
+            hist.pop_front();
+        }
+        hist.clone()
+    };
+
+    if let Err(e) = store.save(&snapshot) {
+        eprintln!("[lan-chat] History save error: {}", e);
+    }
+}
+
 // ───────────────────────── Commandes Tauri ─────────────────────────
 
 #[tauri::command]
@@ -258,7 +402,30 @@ fn send_message(message: ChatMessage) -> Result<(), String> {
         .ok_or_else(|| "Publisher non initialisé".to_string())?;
     let json = serde_json::to_string(&message).map_err(|e| e.to_string())?;
     tx.send(json).map_err(|e| format!("Échec d'envoi : {}", e))?;
+    // Archive immédiate de notre propre message (gossipsub ne nous le renvoie pas)
+    append_to_history(message);
     Ok(())
+}
+
+#[tauri::command]
+fn get_history() -> Vec<ChatMessage> {
+    HISTORY
+        .get()
+        .and_then(|m| m.lock().ok().map(|g| g.iter().cloned().collect()))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn clear_history() -> Result<(), String> {
+    let store = HISTORY_STORE
+        .get()
+        .ok_or_else(|| "Store non initialisé".to_string())?;
+    if let Some(hist_lock) = HISTORY.get() {
+        if let Ok(mut g) = hist_lock.lock() {
+            g.clear();
+        }
+    }
+    store.clear()
 }
 
 // ───────────────────────── Boucle principale du swarm ─────────────────────────
@@ -272,6 +439,25 @@ async fn run_swarm(
     let (topic_str, key_bytes) = derive_room(&room.code);
     let cipher = ChaCha20Poly1305::new_from_slice(&key_bytes)
         .map_err(|e| format!("Initialisation du chiffrement échouée : {}", e))?;
+
+    // Historique chiffré : chemin par salon, clone du cipher pour (dé)chiffrement.
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {}", e))?;
+    let history_store = Arc::new(HistoryStore::new(
+        history_path_for(&app_data, &topic_str),
+        key_bytes,
+    ));
+    let loaded_history = history_store.load();
+    eprintln!(
+        "[lan-chat] History loaded: {} message(s) from {}",
+        loaded_history.len(),
+        history_store.path.display()
+    );
+    let _ = HISTORY.set(Mutex::new(VecDeque::from(loaded_history.clone())));
+    let _ = HISTORY_STORE.set(history_store);
+    let _ = app.emit("history-loaded", loaded_history);
 
     let topic_for_builder = topic_str.clone();
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -400,6 +586,7 @@ async fn run_swarm(
                         };
                         if let Ok(text) = std::str::from_utf8(&plaintext) {
                             if let Ok(msg) = serde_json::from_str::<ChatMessage>(text) {
+                                append_to_history(msg.clone());
                                 let _ = app.emit("chat-message", msg);
                             }
                         }
@@ -428,7 +615,9 @@ pub fn run() {
             get_room_status,
             set_room_code,
             reset_room,
-            send_message
+            send_message,
+            get_history,
+            clear_history
         ])
         .setup(|app| {
             let handle = app.handle().clone();

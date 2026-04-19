@@ -52,6 +52,7 @@ const seenMessageIds = new Set();
 let isReady = false;
 let pollToken = 0;
 let hasAcceptedRoom = false;
+let pendingHistory = null; // chargé dès "history-loaded", rendu dès que isReady (ME.id connu)
 
 // ───────────────────────── DOM ─────────────────────────
 
@@ -164,6 +165,35 @@ function appendSystem(text, variant = "info") {
   el.messages.scrollTop = el.messages.scrollHeight;
 }
 
+function appendSeparator(text) {
+  const sep = document.createElement("div");
+  sep.className = "history-separator";
+  sep.setAttribute("aria-hidden", "true");
+  const span = document.createElement("span");
+  span.textContent = text;
+  sep.appendChild(span);
+  el.messages.appendChild(sep);
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+/**
+ * Rend l'historique chargé depuis Rust dès que l'identité locale (ME.id) est
+ * connue. Si l'event "history-loaded" arrive avant Ready, on le met en attente.
+ */
+function tryRenderHistory() {
+  if (!pendingHistory || !isReady) return;
+  const history = pendingHistory;
+  pendingHistory = null;
+  if (history.length === 0) return;
+
+  for (const m of history) {
+    seenMessageIds.add(m.id); // dedup anticipé si un doublon live arrive
+    registerPeer(m.senderId);
+    appendMessage(m, { mine: m.senderId === ME.id });
+  }
+  appendSeparator("— Nouveaux messages —");
+}
+
 // ───────────────────────── Envoi ─────────────────────────
 
 async function sendMessage(content) {
@@ -215,6 +245,11 @@ function applyStatus(status) {
       setStatus(`Salon « ${roomName} » · ${shortPeerId(ME.id)}`, "ready");
       hideOverlay();
       setInputEnabled(true);
+
+      // L'historique (s'il est arrivé) se rend AVANT le message système "Connecté"
+      // pour que l'ordre visuel soit : [ancien] → séparateur → [nouveau]
+      tryRenderHistory();
+
       appendSystem(
         `Connecté au salon « ${roomName} » (chiffré E2E). Découverte mDNS en cours.`
       );
@@ -295,6 +330,11 @@ listen("chat-message", (event) => {
   registerPeer(msg.senderId);
   if (msg.senderId === ME.id) return; // écho de notre propre publish
   appendMessage(msg, { mine: false });
+});
+
+listen("history-loaded", (event) => {
+  pendingHistory = Array.isArray(event.payload) ? event.payload : [];
+  tryRenderHistory(); // rendra immédiatement si isReady déjà, sinon attendra applyStatus(ready)
 });
 
 listen("node-ready", (event) => {

@@ -299,6 +299,32 @@ textarea {
   background: rgba(255, 90, 100, 0.08);
 }
 
+.history-separator {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 4px 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  font-weight: 600;
+  user-select: none;
+}
+
+.history-separator::before,
+.history-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.history-separator span {
+  white-space: nowrap;
+}
+
 /* ───────── Composer ───────── */
 
 .composer {
