@@ -460,6 +460,226 @@ textarea {
   transform: translateX(-1px);
 }
 
+.composer__attach {
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease),
+              transform 0.1s var(--ease), opacity 0.15s var(--ease);
+  flex: 0 0 auto;
+}
+
+.composer__attach:hover:not(:disabled) {
+  background: #262b38;
+  color: var(--text-primary);
+}
+
+.composer__attach:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.composer__attach:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.composer__attach svg {
+  transform: rotate(-20deg);
+}
+
+/* ───────── Bulle fichier (style Telegram) ───────── */
+
+.file-bubble {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 4px 0 2px;
+}
+
+.file-bubble__action {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease),
+              transform 0.15s var(--ease);
+}
+
+.file-bubble__action:hover:not(:disabled) {
+  background: rgba(77, 142, 255, 0.22);
+}
+
+.file-bubble__action:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.file-bubble__action:disabled {
+  cursor: default;
+}
+
+.message--mine .file-bubble__action {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+
+.message--mine .file-bubble__action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.file-bubble__ring {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.file-bubble__ring-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.08);
+  stroke-width: 2.5;
+}
+
+.message--mine .file-bubble__ring-track {
+  stroke: rgba(255, 255, 255, 0.22);
+}
+
+.file-bubble__ring-progress {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 22px 22px;
+  transition: stroke-dashoffset 0.25s linear;
+}
+
+.message--mine .file-bubble__ring-progress {
+  stroke: #fff;
+}
+
+.file-bubble__icon {
+  position: relative;
+  z-index: 1;
+  font-size: 20px;
+  line-height: 1;
+  transition: transform 0.2s var(--ease), opacity 0.2s var(--ease);
+}
+
+.file-bubble[data-state="downloading"] .file-bubble__icon {
+  animation: file-icon-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes file-icon-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+.file-bubble__info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.file-bubble__name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message--mine .file-bubble__name {
+  color: #fff;
+}
+
+.file-bubble__meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.1px;
+  font-variant-numeric: tabular-nums;
+}
+
+.message--mine .file-bubble__meta {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.file-bubble[data-state="error"] .file-bubble__action {
+  background: rgba(255, 90, 100, 0.14);
+  color: var(--danger);
+}
+
+.file-bubble[data-state="error"] .file-bubble__meta {
+  color: var(--danger);
+}
+
+.file-bubble[data-state="error"] .file-bubble__ring-progress {
+  stroke: var(--danger);
+}
+
+.file-bubble[data-state="completed"] .file-bubble__action {
+  background: rgba(67, 214, 125, 0.14);
+  color: var(--success);
+}
+
+.message--mine .file-bubble[data-state="completed"] .file-bubble__action,
+.file-bubble[data-state="sent"] .file-bubble__action {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+
+/* ───────── Drop overlay (drag-drop fichier) ───────── */
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 12, 16, 0.82);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+  animation: overlay-fade 0.12s var(--ease);
+}
+
+.drop-overlay[hidden] {
+  display: none;
+}
+
+.drop-overlay__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 36px 48px;
+  border-radius: 18px;
+  border: 2px dashed var(--accent);
+  background: rgba(77, 142, 255, 0.08);
+  color: var(--accent);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
 /* ───────── Overlay salon ───────── */
 
 .overlay {

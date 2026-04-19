@@ -1,10 +1,13 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chacha20poly1305::{
@@ -32,9 +35,15 @@ struct ChatBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     history_sync: request_response::json::Behaviour<HistoryRequest, HistoryResponse>,
+    file_transfer: request_response::json::Behaviour<ChunkRequest, ChunkResponse>,
 }
 
 const HISTORY_SYNC_PROTOCOL: &str = "/lan-chat/history-sync/1";
+const FILE_TRANSFER_PROTOCOL: &str = "/lan-chat/file-transfer/1";
+
+// Chunking config pour le transfert fichier
+const FILE_CHUNK_SIZE: u32 = 256 * 1024; // 256 KiB
+const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
 
 // ───────────────────────── Types wire pour la sync d'historique ─────────────────────────
 
@@ -49,6 +58,29 @@ struct HistoryResponse {
     messages: Vec<EncryptedEnvelope>,
 }
 
+// ───────────────────────── Types wire pour le transfert fichier ─────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChunkRequest {
+    version: u32,
+    file_id: String,
+    offset: u64,
+    length: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ChunkResponse {
+    Ok {
+        file_id: String,
+        data: EncryptedEnvelope,
+    },
+    NotFound,
+    Error {
+        message: String,
+    },
+}
+
 // ───────────────────────── Modèles ─────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -59,6 +91,27 @@ struct ChatMessage {
     sender_id: String,
     content: String,
     timestamp: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct FileOffer {
+    id: String,
+    sender_name: String,
+    sender_id: String,
+    timestamp: u64,
+    filename: String,
+    size: u64,
+    mime: String,
+    hash: String,
+}
+
+/// Wrapper unifié pour tout ce qui transite via gossipsub : messages texte + annonces fichiers.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum WireMessage {
+    Chat(ChatMessage),
+    FileOffer(FileOffer),
 }
 
 /// Enveloppe chiffrée publiée sur gossipsub : jamais de clair sur le réseau.
@@ -121,8 +174,35 @@ fn set_node_status(status: NodeStatus) {
 
 static HISTORY: OnceLock<Mutex<Option<VecDeque<ChatMessage>>>> = OnceLock::new();
 static HISTORY_STORE: OnceLock<Mutex<Option<Arc<HistoryStore>>>> = OnceLock::new();
-static PUBLISHER_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<ChatMessage>>>> = OnceLock::new();
+static PUBLISHER_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> = OnceLock::new();
 static MANAGER_TX: OnceLock<mpsc::UnboundedSender<ManagerCmd>> = OnceLock::new();
+
+// ─────────────── Fichiers : état partagé ───────────────
+
+#[derive(Debug, Clone)]
+struct ServedFile {
+    path: PathBuf,
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadState {
+    sender_peer: PeerId,
+    size: u64,
+    expected_hash: String,
+    received_bytes: u64,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+}
+
+enum SwarmFileCmd {
+    RequestChunk { peer: PeerId, request: ChunkRequest },
+}
+
+static SERVED_FILES: OnceLock<Mutex<HashMap<String, ServedFile>>> = OnceLock::new();
+static RECEIVED_OFFERS: OnceLock<Mutex<HashMap<String, FileOffer>>> = OnceLock::new();
+static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashMap<String, DownloadState>>> = OnceLock::new();
+static FILE_CMD_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<SwarmFileCmd>>>> = OnceLock::new();
 
 fn history_cell() -> &'static Mutex<Option<VecDeque<ChatMessage>>> {
     HISTORY.get_or_init(|| Mutex::new(None))
@@ -132,8 +212,24 @@ fn history_store_cell() -> &'static Mutex<Option<Arc<HistoryStore>>> {
     HISTORY_STORE.get_or_init(|| Mutex::new(None))
 }
 
-fn publisher_tx_cell() -> &'static Mutex<Option<mpsc::UnboundedSender<ChatMessage>>> {
+fn publisher_tx_cell() -> &'static Mutex<Option<mpsc::UnboundedSender<WireMessage>>> {
     PUBLISHER_TX.get_or_init(|| Mutex::new(None))
+}
+
+fn served_files_cell() -> &'static Mutex<HashMap<String, ServedFile>> {
+    SERVED_FILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn received_offers_cell() -> &'static Mutex<HashMap<String, FileOffer>> {
+    RECEIVED_OFFERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_downloads_cell() -> &'static Mutex<HashMap<String, DownloadState>> {
+    ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_cmd_tx_cell() -> &'static Mutex<Option<mpsc::UnboundedSender<SwarmFileCmd>>> {
+    FILE_CMD_TX.get_or_init(|| Mutex::new(None))
 }
 
 /// Vide toutes les ressources partagées liées à un salon (appelée lors d'un StartRoom ou LeaveRoom).
@@ -147,6 +243,22 @@ fn clear_shared_state() {
     }
     if let Ok(mut g) = publisher_tx_cell().lock() {
         *g = None;
+    }
+    if let Ok(mut g) = file_cmd_tx_cell().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = served_files_cell().lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = received_offers_cell().lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = active_downloads_cell().lock() {
+        // Best-effort cleanup des tempfiles en cours
+        for (_, state) in g.iter() {
+            let _ = fs::remove_file(&state.temp_path);
+        }
+        g.clear();
     }
 }
 
@@ -391,27 +503,50 @@ fn append_to_history(msg: ChatMessage) {
 
 // ───────────────────────── Chiffrement helpers (factorisé) ─────────────────────────
 
-fn encrypt_chat_message(cipher: &ChaCha20Poly1305, msg: &ChatMessage) -> Option<EncryptedEnvelope> {
-    let json = serde_json::to_vec(msg).ok()?;
+/// Chiffre un blob de bytes quelconque avec la clé du salon, nonce aléatoire par appel.
+fn encrypt_bytes(cipher: &ChaCha20Poly1305, data: &[u8]) -> Option<EncryptedEnvelope> {
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ct = cipher.encrypt(nonce, json.as_slice()).ok()?;
+    let ct = cipher.encrypt(nonce, data).ok()?;
     Some(EncryptedEnvelope {
         n: B64.encode(nonce_bytes),
         c: B64.encode(&ct),
     })
 }
 
-fn decrypt_envelope(cipher: &ChaCha20Poly1305, env: &EncryptedEnvelope) -> Option<ChatMessage> {
+/// Déchiffre une enveloppe en blob de bytes. Silencieux sur toute erreur (mauvaise clé, corruption).
+fn decrypt_bytes(cipher: &ChaCha20Poly1305, env: &EncryptedEnvelope) -> Option<Vec<u8>> {
     let nonce_bytes = B64.decode(&env.n).ok()?;
     if nonce_bytes.len() != 12 {
         return None;
     }
     let ct = B64.decode(&env.c).ok()?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ct.as_slice()).ok()?;
-    serde_json::from_slice::<ChatMessage>(&plaintext).ok()
+    cipher.decrypt(nonce, ct.as_slice()).ok()
+}
+
+/// Helpers typés : wire messages gossipsub (chat + file offers).
+fn encrypt_wire_message(cipher: &ChaCha20Poly1305, msg: &WireMessage) -> Option<EncryptedEnvelope> {
+    let bytes = serde_json::to_vec(msg).ok()?;
+    encrypt_bytes(cipher, &bytes)
+}
+
+fn decrypt_wire_message(cipher: &ChaCha20Poly1305, env: &EncryptedEnvelope) -> Option<WireMessage> {
+    let bytes = decrypt_bytes(cipher, env)?;
+    serde_json::from_slice::<WireMessage>(&bytes).ok()
+}
+
+/// Helpers typés : ChatMessage standalone (utilisé par la history sync, qui échange
+/// directement des ChatMessages indépendants de l'enum WireMessage).
+fn encrypt_chat_message(cipher: &ChaCha20Poly1305, msg: &ChatMessage) -> Option<EncryptedEnvelope> {
+    let bytes = serde_json::to_vec(msg).ok()?;
+    encrypt_bytes(cipher, &bytes)
+}
+
+fn decrypt_chat_message(cipher: &ChaCha20Poly1305, env: &EncryptedEnvelope) -> Option<ChatMessage> {
+    let bytes = decrypt_bytes(cipher, env)?;
+    serde_json::from_slice::<ChatMessage>(&bytes).ok()
 }
 
 // ───────────────────────── Sync d'historique P2P ─────────────────────────
@@ -451,7 +586,7 @@ fn ingest_history_response(
     let mut dup = 0usize;
     let mut decrypt_failed = 0usize;
     for envelope in response.messages {
-        match decrypt_envelope(cipher, &envelope) {
+        match decrypt_chat_message(cipher, &envelope) {
             Some(msg) => {
                 if append_to_history_if_new(msg.clone()) {
                     ingested += 1;
@@ -468,6 +603,260 @@ fn ingest_history_response(
         "[lan-chat] History ingest: {} received → {} new, {} dup, {} decrypt-failed",
         total, ingested, dup, decrypt_failed
     );
+}
+
+// ───────────────────────── Fichiers : helpers ─────────────────────────
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Hash SHA256 en streaming depuis un fichier (buffer 256K) — pas de chargement complet en RAM.
+fn compute_sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Détermine un chemin de destination qui ne collision pas : si `foo.pdf` existe,
+/// retourne `foo (1).pdf`, puis `foo (2).pdf`, etc.
+fn dedupe_filename(dir: &Path, filename: &str) -> PathBuf {
+    let base = dir.join(filename);
+    if !base.exists() {
+        return base;
+    }
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{}", e)),
+        None => (filename.to_string(), String::new()),
+    };
+    for n in 1..10_000 {
+        let candidate = dir.join(format!("{} ({}){}", stem, n, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(filename) // abandonne, renvoie le nom de base même si existe
+}
+
+/// Sert un chunk en lisant la plage demandée depuis le disque, puis en la chiffrant.
+fn serve_chunk(cipher: &ChaCha20Poly1305, req: &ChunkRequest) -> ChunkResponse {
+    if req.version != 1 {
+        return ChunkResponse::Error {
+            message: format!("unsupported chunk-request version {}", req.version),
+        };
+    }
+    let served = match served_files_cell().lock() {
+        Ok(g) => g.get(&req.file_id).cloned(),
+        Err(_) => None,
+    };
+    let Some(served) = served else {
+        return ChunkResponse::NotFound;
+    };
+    let mut file = match fs::File::open(&served.path) {
+        Ok(f) => f,
+        Err(e) => {
+            return ChunkResponse::Error {
+                message: format!("open: {}", e),
+            }
+        }
+    };
+    if let Err(e) = file.seek(SeekFrom::Start(req.offset)) {
+        return ChunkResponse::Error {
+            message: format!("seek: {}", e),
+        };
+    }
+    let remaining = served.size.saturating_sub(req.offset);
+    let to_read = std::cmp::min(req.length as u64, remaining) as usize;
+    let mut buf = vec![0u8; to_read];
+    if let Err(e) = file.read_exact(&mut buf) {
+        return ChunkResponse::Error {
+            message: format!("read: {}", e),
+        };
+    }
+    match encrypt_bytes(cipher, &buf) {
+        Some(envelope) => ChunkResponse::Ok {
+            file_id: req.file_id.clone(),
+            data: envelope,
+        },
+        None => ChunkResponse::Error {
+            message: "encrypt failed".into(),
+        },
+    }
+}
+
+/// Intégre un chunk reçu : decrypt → write to .part → progress → next chunk ou finalize.
+fn ingest_chunk(
+    cipher: &ChaCha20Poly1305,
+    file_id: &str,
+    envelope: EncryptedEnvelope,
+    app: &AppHandle,
+) {
+    // 1. Décrypter
+    let Some(plaintext) = decrypt_bytes(cipher, &envelope) else {
+        emit_file_error(app, file_id, "decrypt failed");
+        abort_download(file_id);
+        return;
+    };
+
+    // 2. Écrire le chunk, maj de l'état, calcul de la suite. Tout sous lock, court.
+    let (received, total, temp_path, sender_peer, completed) = {
+        let mut dl = match active_downloads_cell().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(state) = dl.get_mut(file_id) else {
+            return; // téléchargement annulé (leave_room, etc.)
+        };
+
+        if let Err(e) = OpenOptions::new()
+            .create(false)
+            .append(true)
+            .open(&state.temp_path)
+            .and_then(|mut f| f.write_all(&plaintext))
+        {
+            eprintln!("[lan-chat] File chunk write failed: {}", e);
+            let file_id_owned = file_id.to_string();
+            let temp = state.temp_path.clone();
+            drop(dl); // release lock avant l'emit
+            let _ = fs::remove_file(&temp);
+            emit_file_error(app, &file_id_owned, &format!("write: {}", e));
+            abort_download(&file_id_owned);
+            return;
+        }
+
+        state.received_bytes += plaintext.len() as u64;
+        let completed = state.received_bytes >= state.size;
+        (
+            state.received_bytes,
+            state.size,
+            state.temp_path.clone(),
+            state.sender_peer,
+            completed,
+        )
+    };
+
+    let _ = app.emit(
+        "file-progress",
+        serde_json::json!({
+            "fileId": file_id,
+            "received": received,
+            "total": total,
+        }),
+    );
+
+    if completed {
+        finalize_download(app, file_id, &temp_path);
+    } else {
+        // Demande du chunk suivant
+        let next_offset = received;
+        let next_length = std::cmp::min(FILE_CHUNK_SIZE as u64, total - received) as u32;
+        let req = ChunkRequest {
+            version: 1,
+            file_id: file_id.to_string(),
+            offset: next_offset,
+            length: next_length,
+        };
+        send_file_cmd(SwarmFileCmd::RequestChunk {
+            peer: sender_peer,
+            request: req,
+        });
+    }
+}
+
+fn finalize_download(app: &AppHandle, file_id: &str, temp_path: &Path) {
+    // Vérification SHA256 en streaming
+    let actual_hash = match compute_sha256_file(temp_path) {
+        Ok(h) => h,
+        Err(e) => {
+            emit_file_error(app, file_id, &format!("hash compute failed: {}", e));
+            let _ = fs::remove_file(temp_path);
+            abort_download(file_id);
+            return;
+        }
+    };
+
+    let (expected_hash, final_path) = {
+        let dl = match active_downloads_cell().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(state) = dl.get(file_id) else {
+            return;
+        };
+        (state.expected_hash.clone(), state.final_path.clone())
+    };
+
+    if actual_hash != expected_hash {
+        emit_file_error(app, file_id, "hash mismatch");
+        let _ = fs::remove_file(temp_path);
+        abort_download(file_id);
+        return;
+    }
+
+    if let Err(e) = fs::rename(temp_path, &final_path) {
+        emit_file_error(app, file_id, &format!("rename: {}", e));
+        let _ = fs::remove_file(temp_path);
+        abort_download(file_id);
+        return;
+    }
+
+    eprintln!(
+        "[lan-chat] File download complete: {} ({} bytes)",
+        final_path.display(),
+        expected_hash.len()
+    );
+
+    let _ = app.emit(
+        "file-completed",
+        serde_json::json!({
+            "fileId": file_id,
+            "localPath": final_path.to_string_lossy(),
+        }),
+    );
+
+    // On retire l'entrée
+    if let Ok(mut g) = active_downloads_cell().lock() {
+        g.remove(file_id);
+    }
+}
+
+fn emit_file_error(app: &AppHandle, file_id: &str, msg: &str) {
+    eprintln!("[lan-chat] File error ({}): {}", file_id, msg);
+    let _ = app.emit(
+        "file-error",
+        serde_json::json!({
+            "fileId": file_id,
+            "message": msg,
+        }),
+    );
+}
+
+fn abort_download(file_id: &str) {
+    if let Ok(mut g) = active_downloads_cell().lock() {
+        g.remove(file_id);
+    }
+}
+
+fn send_file_cmd(cmd: SwarmFileCmd) {
+    let tx = file_cmd_tx_cell().lock().ok().and_then(|g| g.as_ref().cloned());
+    let Some(tx) = tx else {
+        eprintln!("[lan-chat] File command channel not initialized");
+        return;
+    };
+    if let Err(e) = tx.send(cmd) {
+        eprintln!("[lan-chat] Failed to send file cmd: {}", e);
+    }
 }
 
 // ───────────────────────── Commandes Tauri ─────────────────────────
@@ -554,10 +943,166 @@ fn send_message(message: ChatMessage) -> Result<(), String> {
             .cloned()
             .ok_or_else(|| "Publisher non initialisé".to_string())?
     };
-    tx.send(message.clone())
+    tx.send(WireMessage::Chat(message.clone()))
         .map_err(|e| format!("Échec d'envoi : {}", e))?;
     // Archive immédiate de notre propre message (gossipsub ne nous le renvoie pas)
     append_to_history(message);
+    Ok(())
+}
+
+#[tauri::command]
+fn offer_file(
+    _app: AppHandle,
+    path: String,
+    file_id: String,
+    sender_name: String,
+) -> Result<FileOffer, String> {
+    let src = PathBuf::from(&path);
+    if !src.is_file() {
+        return Err(format!("Le chemin n'est pas un fichier : {}", path));
+    }
+    let metadata = fs::metadata(&src).map_err(|e| format!("Lecture metadata : {}", e))?;
+    let size = metadata.len();
+    if size == 0 {
+        return Err("Fichier vide.".into());
+    }
+    if size > MAX_FILE_SIZE {
+        return Err(format!(
+            "Fichier trop gros ({} octets, max {} octets).",
+            size, MAX_FILE_SIZE
+        ));
+    }
+
+    let filename = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file.bin")
+        .to_string();
+
+    // On a besoin du PeerId local pour signer l'offer. On le lit depuis node_state.
+    let sender_id = match node_state().lock().ok().map(|g| g.clone()) {
+        Some(NodeStatus::Ready { peer_id, .. }) => peer_id,
+        _ => return Err("Nœud P2P pas encore prêt.".into()),
+    };
+
+    let mime = mime_guess::from_path(&src)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+
+    // Hash streaming (pas de chargement complet en RAM)
+    eprintln!("[lan-chat] Hashing file for offer: {}", src.display());
+    let hash = compute_sha256_file(&src)?;
+
+    let offer = FileOffer {
+        id: file_id.clone(),
+        sender_id,
+        sender_name,
+        timestamp: now_unix_ms(),
+        filename: filename.clone(),
+        size,
+        mime,
+        hash: hash.clone(),
+    };
+
+    // Enregistre la ServedFile localement avant de publier l'annonce.
+    served_files_cell().lock().map_err(|_| "lock poisoned")?.insert(
+        file_id.clone(),
+        ServedFile {
+            path: src.clone(),
+            size,
+        },
+    );
+
+    // Publie l'annonce via gossipsub (wrap en WireMessage::FileOffer)
+    let tx = {
+        let guard = publisher_tx_cell()
+            .lock()
+            .map_err(|_| "Publisher lock empoisonné".to_string())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Publisher non initialisé".to_string())?
+    };
+    tx.send(WireMessage::FileOffer(offer.clone()))
+        .map_err(|e| format!("Envoi offre échoué : {}", e))?;
+
+    eprintln!(
+        "[lan-chat] File offered: \"{}\" ({} bytes, sha256={}…)",
+        offer.filename,
+        offer.size,
+        &offer.hash[..16.min(offer.hash.len())]
+    );
+
+    Ok(offer)
+}
+
+#[tauri::command]
+fn download_file(app: AppHandle, file_id: String, sender_peer: String) -> Result<(), String> {
+    // Retrouve l'offer
+    let offer = received_offers_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&file_id).cloned())
+        .ok_or_else(|| "Offre de fichier inconnue (expirée ?)".to_string())?;
+
+    if offer.size > MAX_FILE_SIZE {
+        return Err(format!(
+            "Fichier trop gros ({} octets > max {} octets).",
+            offer.size, MAX_FILE_SIZE
+        ));
+    }
+
+    let peer = PeerId::from_str(&sender_peer).map_err(|e| format!("PeerId invalide : {}", e))?;
+
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir : {}", e))?;
+    let files_dir = app_data.join("files");
+    fs::create_dir_all(&files_dir).map_err(|e| format!("mkdir files : {}", e))?;
+
+    let final_path = dedupe_filename(&files_dir, &offer.filename);
+    let temp_path = files_dir.join(format!(".{}.part", file_id));
+
+    // Truncate (crée si absent, vide si présent)
+    fs::File::create(&temp_path).map_err(|e| format!("create tempfile : {}", e))?;
+
+    // Déjà un download en cours pour ce file_id ? On skip proprement.
+    {
+        let mut dl = active_downloads_cell()
+            .lock()
+            .map_err(|_| "active_downloads lock poisoned")?;
+        if dl.contains_key(&file_id) {
+            return Err("Téléchargement déjà en cours pour ce fichier.".into());
+        }
+        dl.insert(
+            file_id.clone(),
+            DownloadState {
+                sender_peer: peer,
+                size: offer.size,
+                expected_hash: offer.hash.clone(),
+                received_bytes: 0,
+                temp_path,
+                final_path,
+            },
+        );
+    }
+
+    // Premier chunk
+    let first_len = std::cmp::min(FILE_CHUNK_SIZE as u64, offer.size) as u32;
+    let req = ChunkRequest {
+        version: 1,
+        file_id: file_id.clone(),
+        offset: 0,
+        length: first_len,
+    };
+    send_file_cmd(SwarmFileCmd::RequestChunk { peer, request: req });
+
+    eprintln!(
+        "[lan-chat] Download started: \"{}\" ({} bytes) from {}",
+        offer.filename, offer.size, peer
+    );
     Ok(())
 }
 
@@ -593,7 +1138,8 @@ fn clear_history() -> Result<(), String> {
 
 async fn run_swarm(
     app: AppHandle,
-    mut rx: mpsc::UnboundedReceiver<ChatMessage>,
+    mut rx: mpsc::UnboundedReceiver<WireMessage>,
+    mut file_cmd_rx: mpsc::UnboundedReceiver<SwarmFileCmd>,
     keypair: identity::Keypair,
     room: RoomConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -671,10 +1217,20 @@ async fn run_swarm(
                 request_response::Config::default(),
             );
 
+            let file_transfer = request_response::json::Behaviour::<ChunkRequest, ChunkResponse>::new(
+                [(
+                    StreamProtocol::new(FILE_TRANSFER_PROTOCOL),
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30)),
+            );
+
             Ok(ChatBehaviour {
                 gossipsub,
                 mdns,
                 history_sync,
+                file_transfer,
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -705,11 +1261,11 @@ async fn run_swarm(
         select! {
             maybe_msg = rx.recv() => {
                 match maybe_msg {
-                    Some(message) => {
-                        if let Some(envelope) = encrypt_chat_message(&cipher, &message) {
+                    Some(wire_message) => {
+                        if let Some(envelope) = encrypt_wire_message(&cipher, &wire_message) {
                             match serde_json::to_vec(&envelope) {
-                                Ok(wire) => {
-                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), wire) {
+                                Ok(bytes) => {
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes) {
                                         eprintln!("[lan-chat] Publish error: {}", e);
                                     }
                                 }
@@ -718,6 +1274,14 @@ async fn run_swarm(
                         } else {
                             eprintln!("[lan-chat] Failed to encrypt outgoing message");
                         }
+                    }
+                    None => break,
+                }
+            }
+            maybe_cmd = file_cmd_rx.recv() => {
+                match maybe_cmd {
+                    Some(SwarmFileCmd::RequestChunk { peer, request }) => {
+                        swarm.behaviour_mut().file_transfer.send_request(&peer, request);
                     }
                     None => break,
                 }
@@ -749,10 +1313,69 @@ async fn run_swarm(
                             Ok(e) => e,
                             Err(_) => continue,
                         };
-                        if let Some(msg) = decrypt_envelope(&cipher, &envelope) {
-                            if append_to_history_if_new(msg.clone()) {
-                                let _ = app.emit("chat-message", msg);
+                        match decrypt_wire_message(&cipher, &envelope) {
+                            Some(WireMessage::Chat(msg)) => {
+                                if append_to_history_if_new(msg.clone()) {
+                                    let _ = app.emit("chat-message", msg);
+                                }
                             }
+                            Some(WireMessage::FileOffer(offer)) => {
+                                // Stocker l'offer pour que download_file puisse la retrouver plus tard
+                                if let Ok(mut g) = received_offers_cell().lock() {
+                                    g.insert(offer.id.clone(), offer.clone());
+                                }
+                                eprintln!(
+                                    "[lan-chat] File offer received: \"{}\" ({} bytes) from {}",
+                                    offer.filename, offer.size, offer.sender_id
+                                );
+                                let _ = app.emit("file-offer", offer);
+                            }
+                            None => {
+                                // Décryptage échoué — silencieux, salon voisin ou tampering
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(ChatBehaviourEvent::FileTransfer(ev)) => {
+                        match ev {
+                            request_response::Event::Message { peer, message, .. } => {
+                                match message {
+                                    request_response::Message::Request { request, channel, .. } => {
+                                        let response = serve_chunk(&cipher, &request);
+                                        if let ChunkResponse::Ok { ref file_id, .. } = response {
+                                            eprintln!(
+                                                "[lan-chat] Served chunk of {} @ offset {} ({} bytes) to {}",
+                                                file_id, request.offset, request.length, peer
+                                            );
+                                        }
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .file_transfer
+                                            .send_response(channel, response);
+                                    }
+                                    request_response::Message::Response { response, .. } => {
+                                        match response {
+                                            ChunkResponse::Ok { file_id, data } => {
+                                                ingest_chunk(&cipher, &file_id, data, &app);
+                                            }
+                                            ChunkResponse::NotFound => {
+                                                // On ne peut pas identifier le file_id ici (absent de la variante).
+                                                // On logge seulement ; l'UI pourra détecter via un timeout optionnel (follow-up).
+                                                eprintln!("[lan-chat] Chunk response: NotFound from {}", peer);
+                                            }
+                                            ChunkResponse::Error { message } => {
+                                                eprintln!("[lan-chat] Chunk response error from {}: {}", peer, message);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            request_response::Event::OutboundFailure { peer, error, .. } => {
+                                eprintln!("[lan-chat] File transfer outbound failure to {}: {}", peer, error);
+                            }
+                            request_response::Event::InboundFailure { peer, error, .. } => {
+                                eprintln!("[lan-chat] File transfer inbound failure from {}: {}", peer, error);
+                            }
+                            request_response::Event::ResponseSent { .. } => {}
                         }
                     }
                     SwarmEvent::Behaviour(ChatBehaviourEvent::HistorySync(ev)) => {
@@ -818,6 +1441,8 @@ async fn run_swarm(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             get_hostname,
             get_node_status,
@@ -826,6 +1451,8 @@ pub fn run() {
             leave_room,
             reset_room,
             send_message,
+            offer_file,
+            download_file,
             get_history,
             clear_history
         ])
@@ -879,16 +1506,23 @@ pub fn run() {
                             clear_shared_state();
                             set_node_status(NodeStatus::Initializing);
 
-                            // Nouveau canal publisher par run (les anciens Sender sont détachés).
-                            let (pub_tx, pub_rx) = mpsc::unbounded_channel::<ChatMessage>();
+                            // Nouveaux canaux par run (les anciens Sender sont détachés).
+                            let (pub_tx, pub_rx) = mpsc::unbounded_channel::<WireMessage>();
                             if let Ok(mut g) = publisher_tx_cell().lock() {
                                 *g = Some(pub_tx);
+                            }
+                            let (file_cmd_tx, file_cmd_rx) =
+                                mpsc::unbounded_channel::<SwarmFileCmd>();
+                            if let Ok(mut g) = file_cmd_tx_cell().lock() {
+                                *g = Some(file_cmd_tx);
                             }
 
                             let h_app = handle.clone();
                             let kp = keypair.clone();
                             current = Some(tauri::async_runtime::spawn(async move {
-                                if let Err(e) = run_swarm(h_app.clone(), pub_rx, kp, config).await {
+                                if let Err(e) =
+                                    run_swarm(h_app.clone(), pub_rx, file_cmd_rx, kp, config).await
+                                {
                                     let msg = format!("Erreur libp2p : {}", e);
                                     eprintln!("[lan-chat] {}", msg);
                                     set_node_status(NodeStatus::Error {
