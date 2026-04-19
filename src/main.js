@@ -310,20 +310,33 @@ async function onRoomSubmit(e) {
 
 async function onChangeRoom() {
   const ok = confirm(
-    "Changer de salon supprime ta config locale. Tu devras relancer l'app pour choisir un nouveau code. Continuer ?"
+    "Changer de salon ? L'historique du salon actuel est conservé sur cette machine — tu pourras y revenir en retapant le même code."
   );
   if (!ok) return;
   try {
-    await invoke("reset_room");
-    setStatus("Salon effacé. Relance l'app pour en choisir un nouveau.", "warn");
-    appendSystem(
-      "Salon effacé. Ferme et relance l'app pour rejoindre un autre salon.",
-      "info"
-    );
-    setInputEnabled(false);
+    await invoke("leave_room");
+    // Le listener node-awaiting-room s'occupe du reset UI + affichage de l'overlay
   } catch (err) {
-    appendSystem(`Erreur reset_room : ${err}`, "error");
+    appendSystem(`Erreur leave_room : ${err}`, "error");
   }
+}
+
+/**
+ * Reset complet de l'UI quand le swarm est abandonné (leave_room).
+ * Appelé à la réception de l'event node-awaiting-room après le départ du salon.
+ */
+function resetUiForAwaitingRoom() {
+  el.messages.innerHTML = "";
+  seenMessageIds.clear();
+  seenPeers.clear();
+  el.peersCount.textContent = "0";
+  el.roomBadge.hidden = true;
+  el.roomName.textContent = "—";
+  isReady = false;
+  ME.id = null;
+  hasAcceptedRoom = false;
+  el.meAvatar.style.background = "";
+  setInputEnabled(false);
 }
 
 // ───────────────────────── Événements Tauri ─────────────────────────
@@ -345,7 +358,11 @@ listen("node-ready", (event) => {
 });
 
 listen("node-awaiting-room", () => {
+  resetUiForAwaitingRoom();
   applyStatus({ kind: "awaitingRoom" });
+  // Relance le polling pour détecter le prochain Ready quand l'utilisateur
+  // soumettra un nouveau code (le polling précédent a rendu true sur awaitingRoom).
+  pollStatus();
 });
 
 listen("node-error", (event) => {
