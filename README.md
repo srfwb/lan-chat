@@ -48,7 +48,7 @@ Requirements:
 
 - [Node.js](https://nodejs.org/) 20+
 - [Rust](https://rustup.rs/) stable (1.77+)
-- (Windows) [WiX Toolset v3](https://github.com/wixtoolset/wix3/releases) for MSI builds
+- [WiX Toolset v3](https://github.com/wixtoolset/wix3/releases) for MSI builds (Windows)
 
 ```bash
 git clone https://github.com/srfwb/lan-chat
@@ -57,14 +57,6 @@ npm install
 npm run tauri dev    # dev server with hot-reload
 npm run tauri build  # production bundle (installer + raw exe)
 ```
-
-## Roadmap
-
-- [ ] macOS + Linux builds via GitHub Actions
-- [ ] Hot re-key without rediscovery blackout (~3-5 s today)
-- [ ] Presence indicator (who's online)
-- [ ] Rate-limiting and DoS hardening on the sync protocol
-- [ ] Configurable message retention per room
 
 ## License
 
