@@ -89,6 +89,52 @@ textarea {
   letter-spacing: 0.3px;
 }
 
+.room {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.room__label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.room__name {
+  color: var(--text-primary);
+  font-weight: 600;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room__change {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+  cursor: pointer;
+}
+
+.room__change:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+
 .peers {
   font-size: 12px;
   color: var(--text-muted);
@@ -253,6 +299,32 @@ textarea {
   background: rgba(255, 90, 100, 0.08);
 }
 
+.history-separator {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 4px 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  font-weight: 600;
+  user-select: none;
+}
+
+.history-separator::before,
+.history-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.history-separator span {
+  white-space: nowrap;
+}
+
 /* ───────── Composer ───────── */
 
 .composer {
@@ -352,3 +424,140 @@ textarea {
 .composer__send svg {
   transform: translateX(-1px);
 }
+
+/* ───────── Overlay salon ───────── */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(800px 500px at 20% 10%, rgba(77, 142, 255, 0.18), transparent 70%),
+    rgba(5, 7, 11, 0.94);
+  backdrop-filter: blur(6px);
+  animation: overlay-fade 0.2s var(--ease);
+}
+
+/* Overrides display:flex ci-dessus quand l'attribut HTML `hidden` est présent.
+   Sans cette règle, `.overlay { display: flex }` gagne la cascade contre
+   la règle UA `[hidden] { display: none }` (même spécificité, auteur > UA). */
+.overlay[hidden] {
+  display: none;
+}
+
+@keyframes overlay-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.overlay__card {
+  width: 100%;
+  max-width: 440px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 30px 60px rgba(0, 0, 0, 0.5);
+}
+
+.overlay__logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.overlay__title {
+  font-size: 24px;
+  font-weight: 800;
+  margin: 6px 0 0;
+  letter-spacing: -0.3px;
+}
+
+.overlay__desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.overlay__form {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.overlay__input {
+  flex: 1;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s var(--ease), background 0.15s var(--ease);
+  user-select: text;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.overlay__input:focus {
+  border-color: var(--accent);
+  background: #1d2130;
+}
+
+.overlay__input::placeholder {
+  color: var(--text-muted);
+}
+
+.overlay__submit {
+  padding: 11px 18px;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s var(--ease), transform 0.1s var(--ease);
+}
+
+.overlay__submit:hover {
+  background: #3a7dff;
+}
+
+.overlay__submit:active {
+  transform: scale(0.97);
+}
+
+.overlay__error {
+  margin: 0;
+  padding: 10px 12px;
+  background: rgba(255, 90, 100, 0.1);
+  border: 1px solid rgba(255, 90, 100, 0.3);
+  border-radius: 8px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.overlay__hint {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.status[data-variant="warn"] { color: var(--warn); }
+.status[data-variant="warn"]::before { background: var(--warn); }

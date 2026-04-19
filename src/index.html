@@ -14,6 +14,17 @@
           <span class="brand__dot"></span>
           <span class="brand__name">LAN Chat</span>
         </div>
+        <div class="room" id="room-badge" hidden>
+          <span class="room__label">Salon</span>
+          <span class="room__name" id="room-name">—</span>
+          <button class="room__change" id="change-room-btn" type="button" aria-label="Changer de salon" title="Changer de salon (nécessite un redémarrage)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <polyline points="1 20 1 14 7 14"></polyline>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </svg>
+          </button>
+        </div>
         <div class="peers">
           <span class="peers__count" id="peers-count">0</span>
           <span class="peers__label">pair(s) vu(s)</span>
@@ -48,6 +59,36 @@
           </button>
         </form>
       </footer>
+
+      <div id="room-overlay" class="overlay" hidden>
+        <div class="overlay__card" role="dialog" aria-modal="true" aria-labelledby="overlay-title">
+          <div class="overlay__logo">
+            <span class="brand__dot"></span>
+            <span>LAN Chat</span>
+          </div>
+          <h2 class="overlay__title" id="overlay-title">Rejoindre un salon</h2>
+          <p class="overlay__desc">
+            Entrez un code partagé. Seuls les pairs avec le même code peuvent vous voir. Les messages sont chiffrés de bout en bout avec une clé dérivée du code.
+          </p>
+          <form id="room-form" class="overlay__form">
+            <input
+              id="room-code-input"
+              class="overlay__input"
+              type="text"
+              placeholder="ex : alpha-cafe-7"
+              autocomplete="off"
+              spellcheck="false"
+              maxlength="120"
+              required
+            />
+            <button type="submit" class="overlay__submit">Rejoindre</button>
+          </form>
+          <p id="room-error" class="overlay__error" hidden></p>
+          <p class="overlay__hint">
+            Astuce : invente un code et partage-le à tes pairs de confiance. Tout autre code ne pourra ni voir ni déchiffrer vos messages.
+          </p>
+        </div>
+      </div>
     </div>
   </body>
 </html>
