@@ -141,15 +141,30 @@ pub fn history_path_for(app_data: &Path, topic: &str) -> PathBuf {
 
 /// Ajoute un message à l'historique en mémoire et persiste (best-effort).
 /// Retourne `true` si nouveau, `false` si déjà présent (dédup par id) ou stores pas initialisés.
+/// Les deux cas `false` sans log étaient silencieux : on logue maintenant les échecs d'init
+/// et de lock pour détecter les races d'ordonnancement (ex : message envoyé pendant la
+/// fenêtre entre StartRoom et l'init de `history_cell` dans `run_swarm`).
 pub fn append_to_history_if_new(msg: ChatMessage) -> bool {
     let snapshot = {
         let mut guard = match history_cell().lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(_) => {
+                eprintln!(
+                    "[lan-chat] History cell lock empoisonné — message {} non archivé",
+                    msg.id
+                );
+                return false;
+            }
         };
         let hist = match guard.as_mut() {
             Some(h) => h,
-            None => return false,
+            None => {
+                eprintln!(
+                    "[lan-chat] History cell non initialisée — message {} non archivé (race ?)",
+                    msg.id
+                );
+                return false;
+            }
         };
         if hist.iter().any(|m| m.id == msg.id) {
             return false;
